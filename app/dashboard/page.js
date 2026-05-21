@@ -45,6 +45,7 @@ export default function DashboardPage() {
   const [habits, setHabits] = useState([])
   const [completions, setCompletions] = useState({})
   const [toggling, setToggling] = useState(new Set())
+  const [habitToDelete, setHabitToDelete] = useState(null)
   const [loading, setLoading] = useState(true)
   const router = useRouter()
 
@@ -92,6 +93,19 @@ export default function DashboardPage() {
     const supabase = createClient()
     await supabase.auth.signOut()
     window.location.href = '/login'
+  }
+
+  async function confirmDeleteHabit() {
+    const habit = habitToDelete
+    setHabitToDelete(null)
+    const supabase = createClient()
+    await supabase.from('habits').delete().eq('id', habit.id)
+    setHabits(prev => prev.filter(h => h.id !== habit.id))
+    setCompletions(prev => {
+      const next = { ...prev }
+      delete next[habit.id]
+      return next
+    })
   }
 
   async function toggleCompletion(habit) {
@@ -200,7 +214,7 @@ export default function DashboardPage() {
                 return (
                   <li
                     key={habit.id}
-                    className={`bg-gray-800 rounded-xl px-5 py-4 flex items-center justify-between transition-all ${
+                    className={`group bg-gray-800 rounded-xl px-5 py-4 flex items-center justify-between transition-all ${
                       completedToday ? 'border border-green-600/40' : 'border border-transparent'
                     }`}
                   >
@@ -231,9 +245,18 @@ export default function DashboardPage() {
                         {habit.name}
                       </span>
                     </div>
-                    <div className="flex items-center gap-1">
+                    <div className="flex items-center gap-3">
                       <span className="text-xl font-bold text-orange-500">{streak}</span>
                       <span className="text-xl">🔥</span>
+                      <button
+                        onClick={() => setHabitToDelete(habit)}
+                        aria-label="Delete habit"
+                        className="opacity-0 group-hover:opacity-100 transition-opacity text-red-500 hover:text-red-400 p-1"
+                      >
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
                     </div>
                   </li>
                 )
@@ -242,6 +265,44 @@ export default function DashboardPage() {
           )}
         </section>
       </main>
+
+      {habitToDelete && (
+        <div
+          className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 px-4"
+          onClick={() => setHabitToDelete(null)}
+        >
+          <div
+            className="bg-gray-800 rounded-2xl p-8 max-w-sm w-full flex flex-col items-center gap-4"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="w-14 h-14 rounded-full bg-red-500/10 flex items-center justify-center">
+              <svg className="w-7 h-7 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+            </div>
+            <h2 className="text-xl font-bold text-white">Delete Habit</h2>
+            <p className="text-gray-400 text-center text-sm">
+              Are you sure you want to delete{' '}
+              <span className="text-orange-500 font-semibold">{habitToDelete.name}</span>
+              ? All your streak data will be lost forever.
+            </p>
+            <div className="flex gap-3 w-full mt-2">
+              <button
+                onClick={() => setHabitToDelete(null)}
+                className="flex-1 px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white hover:border-gray-400 transition-colors text-sm font-semibold"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDeleteHabit}
+                className="flex-1 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white transition-colors text-sm font-semibold"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
