@@ -6,7 +6,10 @@ import Link from 'next/link'
 import { createClient } from '@/lib/supabase'
 
 function toDateStr(date) {
-  return date.toISOString().split('T')[0]
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
 function calculateStreak(completions) {
@@ -15,7 +18,7 @@ function calculateStreak(completions) {
   const yesterday = new Date(today)
   yesterday.setDate(yesterday.getDate() - 1)
 
-  const completedDates = new Set(completions.map(c => c.completed_at))
+  const completedDates = new Set(completions.map(c => c.completed_date))
   const todayStr = toDateStr(today)
   const yesterdayStr = toDateStr(yesterday)
 
@@ -68,7 +71,7 @@ export default function DashboardPage() {
       if (habits.length > 0) {
         const { data: completionsData } = await supabase
           .from('completions')
-          .select('habit_id, completed_at')
+          .select('habit_id, completed_date')
           .eq('user_id', user.id)
           .in('habit_id', habits.map(h => h.id))
 
@@ -97,7 +100,7 @@ export default function DashboardPage() {
 
     const supabase = createClient()
     const habitCompletions = completions[habit.id] ?? []
-    const completedToday = habitCompletions.some(c => c.completed_at === todayStr)
+    const completedToday = habitCompletions.some(c => c.completed_date === todayStr)
 
     if (completedToday) {
       await supabase
@@ -105,20 +108,20 @@ export default function DashboardPage() {
         .delete()
         .eq('habit_id', habit.id)
         .eq('user_id', user.id)
-        .eq('completed_at', todayStr)
+        .eq('completed_date', todayStr)
 
       setCompletions(prev => ({
         ...prev,
-        [habit.id]: prev[habit.id].filter(c => c.completed_at !== todayStr),
+        [habit.id]: prev[habit.id].filter(c => c.completed_date !== todayStr),
       }))
     } else {
       await supabase
         .from('completions')
-        .insert({ habit_id: habit.id, user_id: user.id, completed_at: todayStr })
+        .insert({ habit_id: habit.id, user_id: user.id, completed_date: todayStr })
 
       setCompletions(prev => ({
         ...prev,
-        [habit.id]: [...(prev[habit.id] ?? []), { habit_id: habit.id, completed_at: todayStr }],
+        [habit.id]: [...(prev[habit.id] ?? []), { habit_id: habit.id, completed_date: todayStr }],
       }))
     }
 
@@ -190,7 +193,7 @@ export default function DashboardPage() {
             <ul className="space-y-3">
               {habits.map((habit) => {
                 const habitCompletions = completions[habit.id] ?? []
-                const completedToday = habitCompletions.some(c => c.completed_at === todayStr)
+                const completedToday = habitCompletions.some(c => c.completed_date === todayStr)
                 const streak = calculateStreak(habitCompletions)
                 const isToggling = toggling.has(habit.id)
 
