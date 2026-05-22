@@ -47,6 +47,7 @@ export default function DashboardPage() {
   const [toggling, setToggling] = useState(new Set())
   const [habitToDelete, setHabitToDelete] = useState(null)
   const [partners, setPartners] = useState([])
+  const [pendingInvites, setPendingInvites] = useState([])
   const [loading, setLoading] = useState(true)
   const router = useRouter()
 
@@ -133,6 +134,29 @@ export default function DashboardPage() {
       )
       setPartners(partnersWithData)
 
+      const { data: pendingData } = await supabase
+        .from('partnerships')
+        .select('*')
+        .eq('partner_id', user.id)
+        .eq('status', 'pending')
+
+      const pendingWithProfiles = await Promise.all(
+        (pendingData ?? []).map(async (p) => {
+          const { data: profile } = await supabase
+            .from('profiles')
+            .select('id, email, full_name')
+            .eq('id', p.user_id)
+            .single()
+          return {
+            partnershipId: p.id,
+            inviterId: p.user_id,
+            inviterEmail: profile?.email ?? '',
+            inviterName: profile?.full_name ?? '',
+          }
+        })
+      )
+      setPendingInvites(pendingWithProfiles)
+
       setLoading(false)
     }
     load()
@@ -193,6 +217,53 @@ export default function DashboardPage() {
       next.delete(habit.id)
       return next
     })
+  }
+
+  async function handlePendingAction(invite, newStatus) {
+    const supabase = createClient()
+    const { error } = await supabase
+      .from('partnerships')
+      .update({ status: newStatus })
+      .eq('id', invite.partnershipId)
+
+    if (error) return
+
+    setPendingInvites(prev => prev.filter(p => p.partnershipId !== invite.partnershipId))
+
+    if (newStatus === 'active') {
+      const { data: partnerHabits } = await supabase
+        .from('habits')
+        .select('id')
+        .eq('user_id', invite.inviterId)
+
+      const habitIds = (partnerHabits ?? []).map(h => h.id)
+      let totalStreak = 0
+
+      if (habitIds.length > 0) {
+        const { data: partnerCompletions } = await supabase
+          .from('completions')
+          .select('habit_id, completed_date')
+          .eq('user_id', invite.inviterId)
+          .in('habit_id', habitIds)
+
+        const completionMap = {}
+        for (const h of partnerHabits) completionMap[h.id] = []
+        for (const c of partnerCompletions ?? []) {
+          if (completionMap[c.habit_id]) completionMap[c.habit_id].push(c)
+        }
+        totalStreak = (partnerHabits ?? []).reduce(
+          (sum, habit) => sum + calculateStreak(completionMap[habit.id] ?? []),
+          0
+        )
+      }
+
+      setPartners(prev => [...prev, {
+        id: invite.inviterId,
+        email: invite.inviterEmail,
+        fullName: invite.inviterName,
+        totalStreak,
+      }])
+    }
   }
 
   if (loading) {
@@ -313,6 +384,40 @@ export default function DashboardPage() {
             </ul>
           )}
         </section>
+
+        {pendingInvites.length > 0 && (
+          <section>
+            <h3 className="text-lg font-semibold text-white mb-4">Pending Invites</h3>
+            <ul className="space-y-3">
+              {pendingInvites.map((invite) => (
+                <li key={invite.partnershipId} className="bg-gray-800 rounded-xl px-5 py-4 flex items-center justify-between">
+                  <div>
+                    {invite.inviterName && (
+                      <p className="font-medium text-white">{invite.inviterName}</p>
+                    )}
+                    <p className={invite.inviterName ? 'text-sm text-gray-400' : 'font-medium text-white'}>
+                      {invite.inviterEmail}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => handlePendingAction(invite, 'declined')}
+                      className="px-3 py-1.5 rounded-lg border border-gray-600 text-gray-300 hover:text-white hover:border-gray-400 transition-colors text-sm font-semibold"
+                    >
+                      Decline
+                    </button>
+                    <button
+                      onClick={() => handlePendingAction(invite, 'active')}
+                      className="px-3 py-1.5 rounded-lg bg-orange-500 hover:bg-orange-600 text-white transition-colors text-sm font-semibold"
+                    >
+                      Accept
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
 
         <section>
           <div className="flex items-center justify-between mb-4">

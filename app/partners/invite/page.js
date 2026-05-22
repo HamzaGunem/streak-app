@@ -6,6 +6,7 @@ import { createClient } from '@/lib/supabase'
 
 export default function InvitePartnerPage() {
   const [email, setEmail] = useState('')
+  const [successEmail, setSuccessEmail] = useState('')
   const [status, setStatus] = useState(null)
   const [loading, setLoading] = useState(false)
 
@@ -29,12 +30,32 @@ export default function InvitePartnerPage() {
       return
     }
 
-    const { error } = await supabase
+    const { data: inserted, error } = await supabase
       .from('partnerships')
       .insert({ user_id: user.id, partner_id: profile.id, status: 'pending' })
+      .select('id')
+      .single()
 
-    setStatus(error ? 'error' : 'success')
-    if (!error) setEmail('')
+    if (error) {
+      setStatus('error')
+      setLoading(false)
+      return
+    }
+
+    const sentEmail = email.trim().toLowerCase()
+    const res = await fetch('/api/invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: sentEmail, partnership_id: inserted.id }),
+    })
+
+    if (res.ok) {
+      setSuccessEmail(sentEmail)
+      setStatus('success')
+    } else {
+      setStatus('email_error')
+    }
+    setEmail('')
     setLoading(false)
   }
 
@@ -83,7 +104,13 @@ export default function InvitePartnerPage() {
 
               {status === 'success' && (
                 <div className="bg-green-500/10 border border-green-500/30 rounded-lg px-4 py-3">
-                  <p className="text-green-400 text-sm font-medium">Invite sent!</p>
+                  <p className="text-green-400 text-sm font-medium">Invite sent! We emailed {successEmail}</p>
+                </div>
+              )}
+
+              {status === 'email_error' && (
+                <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg px-4 py-3">
+                  <p className="text-yellow-400 text-sm font-medium">Partnership created but email could not be sent.</p>
                 </div>
               )}
 
