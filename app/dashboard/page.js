@@ -46,6 +46,7 @@ export default function DashboardPage() {
   const [completions, setCompletions] = useState({})
   const [toggling, setToggling] = useState(new Set())
   const [habitToDelete, setHabitToDelete] = useState(null)
+  const [partners, setPartners] = useState([])
   const [loading, setLoading] = useState(true)
   const router = useRouter()
 
@@ -83,6 +84,54 @@ export default function DashboardPage() {
         }
         setCompletions(map)
       }
+
+      const { data: partnershipsData } = await supabase
+        .from('partnerships')
+        .select('*')
+        .or(`user_id.eq.${user.id},partner_id.eq.${user.id}`)
+        .eq('status', 'active')
+
+      const activePartnerships = partnershipsData ?? []
+      const partnersWithData = await Promise.all(
+        activePartnerships.map(async (p) => {
+          const partnerId = p.user_id === user.id ? p.partner_id : p.user_id
+
+          const { data: profile } = await supabase
+            .from('profiles')
+            .select('id, email, full_name')
+            .eq('id', partnerId)
+            .single()
+
+          const { data: partnerHabits } = await supabase
+            .from('habits')
+            .select('id')
+            .eq('user_id', partnerId)
+
+          const habitIds = (partnerHabits ?? []).map(h => h.id)
+          let totalStreak = 0
+
+          if (habitIds.length > 0) {
+            const { data: partnerCompletions } = await supabase
+              .from('completions')
+              .select('habit_id, completed_date')
+              .eq('user_id', partnerId)
+              .in('habit_id', habitIds)
+
+            const completionMap = {}
+            for (const h of partnerHabits) completionMap[h.id] = []
+            for (const c of partnerCompletions ?? []) {
+              if (completionMap[c.habit_id]) completionMap[c.habit_id].push(c)
+            }
+            totalStreak = (partnerHabits ?? []).reduce(
+              (sum, habit) => sum + calculateStreak(completionMap[habit.id] ?? []),
+              0
+            )
+          }
+
+          return { id: partnerId, email: profile?.email ?? '', fullName: profile?.full_name ?? '', totalStreak }
+        })
+      )
+      setPartners(partnersWithData)
 
       setLoading(false)
     }
@@ -261,6 +310,43 @@ export default function DashboardPage() {
                   </li>
                 )
               })}
+            </ul>
+          )}
+        </section>
+
+        <section>
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold text-white">Partners</h3>
+            <Link
+              href="/partners/invite"
+              className="bg-orange-500 hover:bg-orange-600 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors"
+            >
+              Invite Partner
+            </Link>
+          </div>
+
+          {partners.length === 0 ? (
+            <div className="bg-gray-800 rounded-xl p-10 text-center">
+              <p className="text-gray-400">No active partners yet. Invite someone to keep each other accountable!</p>
+            </div>
+          ) : (
+            <ul className="space-y-3">
+              {partners.map((partner) => (
+                <li key={partner.id} className="bg-gray-800 rounded-xl px-5 py-4 flex items-center justify-between">
+                  <div>
+                    {partner.fullName && (
+                      <p className="font-medium text-white">{partner.fullName}</p>
+                    )}
+                    <p className={partner.fullName ? 'text-sm text-gray-400' : 'font-medium text-white'}>
+                      {partner.email}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xl font-bold text-orange-500">{partner.totalStreak}</span>
+                    <span className="text-xl">🔥</span>
+                  </div>
+                </li>
+              ))}
             </ul>
           )}
         </section>
