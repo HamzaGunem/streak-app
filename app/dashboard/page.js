@@ -9,34 +9,41 @@ function toDateStr(date) {
   const year = date.getFullYear()
   const month = String(date.getMonth() + 1).padStart(2, '0')
   const day = String(date.getDate()).padStart(2, '0')
-  return `${year}-${month}-${day}`
+  return year + '-' + month + '-' + day
 }
 
 function calculateStreak(completions) {
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  const yesterday = new Date(today)
-  yesterday.setDate(yesterday.getDate() - 1)
+  if (!completions || completions.length === 0) return 0
 
-  const completedDates = new Set(completions.map(c => c.completed_date))
+  const today = new Date()
   const todayStr = toDateStr(today)
+
+  const yesterday = new Date()
+  yesterday.setDate(yesterday.getDate() - 1)
   const yesterdayStr = toDateStr(yesterday)
 
-  let startDate
-  if (completedDates.has(todayStr)) {
-    startDate = new Date(today)
-  } else if (completedDates.has(yesterdayStr)) {
-    startDate = new Date(yesterday)
-  } else {
+  const completedDates = new Set(
+    completions.map(c => c.completed_date)
+  )
+
+  if (!completedDates.has(todayStr) &&
+      !completedDates.has(yesterdayStr)) {
     return 0
   }
 
+  const startDateStr = completedDates.has(todayStr)
+    ? todayStr
+    : yesterdayStr
+
+  const startDate = new Date(startDateStr)
   let streak = 0
   const current = new Date(startDate)
+
   while (completedDates.has(toDateStr(current))) {
     streak++
     current.setDate(current.getDate() - 1)
   }
+
   return streak
 }
 
@@ -48,6 +55,7 @@ export default function DashboardPage() {
   const [habitToDelete, setHabitToDelete] = useState(null)
   const [partners, setPartners] = useState([])
   const [pendingInvites, setPendingInvites] = useState([])
+  const [sentPendingPartners, setSentPendingPartners] = useState([])
   const [loading, setLoading] = useState(true)
   const router = useRouter()
 
@@ -86,53 +94,37 @@ export default function DashboardPage() {
         setCompletions(map)
       }
 
-      const { data: partnershipsData } = await supabase
+      const { data: { session } } = await supabase.auth.getSession()
+      const response = await fetch('/api/partner-data', {
+        headers: { 'Authorization': `Bearer ${session.access_token}` }
+      })
+      const partnerData = await response.json()
+      setPartners(partnerData)
+
+      const { data: sentPendingData } = await supabase
         .from('partnerships')
         .select('*')
-        .or(`user_id.eq.${user.id},partner_id.eq.${user.id}`)
-        .eq('status', 'active')
+        .eq('user_id', user.id)
+        .eq('status', 'pending')
 
-      const activePartnerships = partnershipsData ?? []
-      const partnersWithData = await Promise.all(
-        activePartnerships.map(async (p) => {
-          const partnerId = p.user_id === user.id ? p.partner_id : p.user_id
+      const sentPendingIds = (sentPendingData ?? []).map(p => p.partner_id)
+      let sentPendingEmailMap = {}
+      if (sentPendingIds.length > 0) {
+        const { data: sentPendingProfiles } = await supabase
+          .from('profiles')
+          .select('id, email')
+          .in('id', sentPendingIds)
+        console.log('Sent pending profiles:', sentPendingProfiles)
+        for (const profile of sentPendingProfiles ?? []) {
+          sentPendingEmailMap[profile.id] = profile.email
+        }
+      }
 
-          const { data: profile } = await supabase
-            .from('profiles')
-            .select('id, email, full_name')
-            .eq('id', partnerId)
-            .single()
-
-          const { data: partnerHabits } = await supabase
-            .from('habits')
-            .select('id')
-            .eq('user_id', partnerId)
-
-          const habitIds = (partnerHabits ?? []).map(h => h.id)
-          let totalStreak = 0
-
-          if (habitIds.length > 0) {
-            const { data: partnerCompletions } = await supabase
-              .from('completions')
-              .select('habit_id, completed_date')
-              .eq('user_id', partnerId)
-              .in('habit_id', habitIds)
-
-            const completionMap = {}
-            for (const h of partnerHabits) completionMap[h.id] = []
-            for (const c of partnerCompletions ?? []) {
-              if (completionMap[c.habit_id]) completionMap[c.habit_id].push(c)
-            }
-            totalStreak = (partnerHabits ?? []).reduce(
-              (sum, habit) => sum + calculateStreak(completionMap[habit.id] ?? []),
-              0
-            )
-          }
-
-          return { id: partnerId, email: profile?.email ?? '', fullName: profile?.full_name ?? '', totalStreak }
-        })
-      )
-      setPartners(partnersWithData)
+      const sentPendingWithProfiles = (sentPendingData ?? []).map(p => ({
+        id: p.partner_id,
+        email: sentPendingEmailMap[p.partner_id] ?? 'Unknown user',
+      }))
+      setSentPendingPartners(sentPendingWithProfiles)
 
       const { data: pendingData } = await supabase
         .from('partnerships')
@@ -140,21 +132,24 @@ export default function DashboardPage() {
         .eq('partner_id', user.id)
         .eq('status', 'pending')
 
-      const pendingWithProfiles = await Promise.all(
-        (pendingData ?? []).map(async (p) => {
-          const { data: profile } = await supabase
-            .from('profiles')
-            .select('id, email, full_name')
-            .eq('id', p.user_id)
-            .single()
-          return {
-            partnershipId: p.id,
-            inviterId: p.user_id,
-            inviterEmail: profile?.email ?? '',
-            inviterName: profile?.full_name ?? '',
-          }
-        })
-      )
+      const inviterIds = (pendingData ?? []).map(p => p.user_id)
+      let inviterEmailMap = {}
+      if (inviterIds.length > 0) {
+        const { data: inviterProfiles } = await supabase
+          .from('profiles')
+          .select('id, email')
+          .in('id', inviterIds)
+        console.log('Inviter profiles:', inviterProfiles)
+        for (const profile of inviterProfiles ?? []) {
+          inviterEmailMap[profile.id] = profile.email
+        }
+      }
+
+      const pendingWithProfiles = (pendingData ?? []).map(p => ({
+        partnershipId: p.id,
+        inviterId: p.user_id,
+        inviterEmail: inviterEmailMap[p.user_id] ?? 'Unknown user',
+      }))
       setPendingInvites(pendingWithProfiles)
 
       setLoading(false)
@@ -231,38 +226,12 @@ export default function DashboardPage() {
     setPendingInvites(prev => prev.filter(p => p.partnershipId !== invite.partnershipId))
 
     if (newStatus === 'active') {
-      const { data: partnerHabits } = await supabase
-        .from('habits')
-        .select('id')
-        .eq('user_id', invite.inviterId)
-
-      const habitIds = (partnerHabits ?? []).map(h => h.id)
-      let totalStreak = 0
-
-      if (habitIds.length > 0) {
-        const { data: partnerCompletions } = await supabase
-          .from('completions')
-          .select('habit_id, completed_date')
-          .eq('user_id', invite.inviterId)
-          .in('habit_id', habitIds)
-
-        const completionMap = {}
-        for (const h of partnerHabits) completionMap[h.id] = []
-        for (const c of partnerCompletions ?? []) {
-          if (completionMap[c.habit_id]) completionMap[c.habit_id].push(c)
-        }
-        totalStreak = (partnerHabits ?? []).reduce(
-          (sum, habit) => sum + calculateStreak(completionMap[habit.id] ?? []),
-          0
-        )
-      }
-
-      setPartners(prev => [...prev, {
-        id: invite.inviterId,
-        email: invite.inviterEmail,
-        fullName: invite.inviterName,
-        totalStreak,
-      }])
+      const { data: { session } } = await supabase.auth.getSession()
+      const response = await fetch('/api/partner-data', {
+        headers: { 'Authorization': `Bearer ${session.access_token}` }
+      })
+      const partnerData = await response.json()
+      setPartners(partnerData)
     }
   }
 
@@ -392,12 +361,7 @@ export default function DashboardPage() {
               {pendingInvites.map((invite) => (
                 <li key={invite.partnershipId} className="bg-gray-800 rounded-xl px-5 py-4 flex items-center justify-between">
                   <div>
-                    {invite.inviterName && (
-                      <p className="font-medium text-white">{invite.inviterName}</p>
-                    )}
-                    <p className={invite.inviterName ? 'text-sm text-gray-400' : 'font-medium text-white'}>
-                      {invite.inviterEmail}
-                    </p>
+                    <p className="font-medium text-white">{invite.inviterEmail}</p>
                   </div>
                   <div className="flex gap-2">
                     <button
@@ -430,26 +394,59 @@ export default function DashboardPage() {
             </Link>
           </div>
 
-          {partners.length === 0 ? (
+          {partners.length === 0 && sentPendingPartners.length === 0 ? (
             <div className="bg-gray-800 rounded-xl p-10 text-center">
               <p className="text-gray-400">No active partners yet. Invite someone to keep each other accountable!</p>
             </div>
           ) : (
             <ul className="space-y-3">
               {partners.map((partner) => (
+                <li key={partner.id} className="bg-gray-800 rounded-xl px-5 py-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium text-white">{partner.email}</span>
+                      <span className="px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 text-xs font-semibold">Active</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xl font-bold text-orange-500">{partner.totalStreak}</span>
+                      <span className="text-xl">🔥</span>
+                    </div>
+                  </div>
+                  {partner.habits && partner.habits.length > 0 && (
+                    <ul className="mt-3 space-y-2">
+                      {partner.habits.map((habit) => (
+                        <li key={habit.id} className="flex items-center justify-between py-1">
+                          <div className="flex items-center gap-3">
+                            <div className={`w-6 h-6 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
+                              habit.completedToday ? 'bg-green-500 border-green-500 text-white' : 'border-gray-500'
+                            }`}>
+                              {habit.completedToday && (
+                                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                                </svg>
+                              )}
+                            </div>
+                            <span className={`text-sm ${habit.completedToday ? 'text-green-400' : 'text-gray-300'}`}>
+                              {habit.name}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <span className="font-bold text-orange-500">{habit.streak}</span>
+                            <span>🔥</span>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+              ))}
+              {sentPendingPartners.map((partner) => (
                 <li key={partner.id} className="bg-gray-800 rounded-xl px-5 py-4 flex items-center justify-between">
-                  <div>
-                    {partner.fullName && (
-                      <p className="font-medium text-white">{partner.fullName}</p>
-                    )}
-                    <p className={partner.fullName ? 'text-sm text-gray-400' : 'font-medium text-white'}>
-                      {partner.email}
-                    </p>
-                  </div>
                   <div className="flex items-center gap-2">
-                    <span className="text-xl font-bold text-orange-500">{partner.totalStreak}</span>
-                    <span className="text-xl">🔥</span>
+                    <span className="font-medium text-white">{partner.email}</span>
+                    <span className="px-2 py-0.5 rounded-full bg-yellow-500/20 text-yellow-400 text-xs font-semibold">Pending</span>
                   </div>
+                  <div />
                 </li>
               ))}
             </ul>
