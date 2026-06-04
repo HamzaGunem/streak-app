@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(Remove-Item *)",
-      "Bash(node *)"
+      "Bash(node *)",
+      "PowerShell(New-Item *)"
     ]
   }
 }

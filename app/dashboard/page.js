@@ -12,145 +12,155 @@ function toDateStr(date) {
   return year + '-' + month + '-' + day
 }
 
-function calculateStreak(completions) {
-  if (!completions || completions.length === 0) return 0
-
+function calculateStreak(checkins, userId) {
+  if (!checkins || checkins.length === 0) return 0
+  const userCheckins = checkins.filter(c => c.user_id === userId)
   const today = new Date()
   const todayStr = toDateStr(today)
-
   const yesterday = new Date()
   yesterday.setDate(yesterday.getDate() - 1)
   const yesterdayStr = toDateStr(yesterday)
-
-  const completedDates = new Set(
-    completions.map(c => c.completed_date)
-  )
-
-  if (!completedDates.has(todayStr) &&
-      !completedDates.has(yesterdayStr)) {
-    return 0
-  }
-
-  const startDateStr = completedDates.has(todayStr)
-    ? todayStr
-    : yesterdayStr
-
-  const startDate = new Date(startDateStr)
+  const dates = new Set(userCheckins.map(c => c.checkin_date))
+  if (!dates.has(todayStr) && !dates.has(yesterdayStr)) return 0
+  const startStr = dates.has(todayStr) ? todayStr : yesterdayStr
   let streak = 0
-  const current = new Date(startDate)
-
-  while (completedDates.has(toDateStr(current))) {
+  const current = new Date(startStr)
+  while (dates.has(toDateStr(current))) {
     streak++
     current.setDate(current.getDate() - 1)
   }
+  return streak
+}
 
+function calculatePersonalStreak(completions) {
+  if (!completions || completions.length === 0) return 0
+  const today = new Date()
+  const todayStr = toDateStr(today)
+  const yesterday = new Date()
+  yesterday.setDate(yesterday.getDate() - 1)
+  const yesterdayStr = toDateStr(yesterday)
+  const dates = new Set(completions.map(c => c.completed_date))
+  if (!dates.has(todayStr) && !dates.has(yesterdayStr)) return 0
+  const startStr = dates.has(todayStr) ? todayStr : yesterdayStr
+  let streak = 0
+  const current = new Date(startStr)
+  while (dates.has(toDateStr(current))) {
+    streak++
+    current.setDate(current.getDate() - 1)
+  }
   return streak
 }
 
 export default function DashboardPage() {
   const [user, setUser] = useState(null)
+  const [profile, setProfile] = useState(null)
+  const [challenges, setChallenges] = useState([])
+  const [pendingChallenges, setPendingChallenges] = useState([])
   const [habits, setHabits] = useState([])
-  const [completions, setCompletions] = useState({})
-  const [toggling, setToggling] = useState(new Set())
+  const [personalCompletions, setPersonalCompletions] = useState({})
+  const [checkingIn, setCheckingIn] = useState(new Set())
+  const [togglingHabit, setTogglingHabit] = useState(new Set())
   const [habitToDelete, setHabitToDelete] = useState(null)
-  const [partners, setPartners] = useState([])
-  const [pendingInvites, setPendingInvites] = useState([])
-  const [sentPendingPartners, setSentPendingPartners] = useState([])
   const [loading, setLoading] = useState(true)
   const router = useRouter()
-
   const todayStr = toDateStr(new Date())
 
   useEffect(() => {
     async function load() {
       const supabase = createClient()
       const { data: { user } } = await supabase.auth.getUser()
-      if (!user) {
-        router.replace('/login')
-        return
-      }
+      if (!user) { router.replace('/login'); return }
       setUser(user)
 
+      const { data: profileData } = await supabase
+        .from('profiles')
+        .select('id, username, email')
+        .eq('id', user.id)
+        .maybeSingle()
+      setProfile(profileData)
+
+      // Active challenges
+      const { data: activeChallenges } = await supabase
+        .from('habit_challenges')
+        .select('*')
+        .or(`challenger_id.eq.${user.id},opponent_id.eq.${user.id}`)
+        .eq('status', 'active')
+
+      if (activeChallenges && activeChallenges.length > 0) {
+        const opponentIds = activeChallenges.map(c =>
+          c.challenger_id === user.id ? c.opponent_id : c.challenger_id
+        )
+        const { data: opponentProfiles } = await supabase
+          .from('profiles')
+          .select('id, username, email')
+          .in('id', opponentIds)
+        const profileMap = {}
+        for (const p of opponentProfiles ?? []) profileMap[p.id] = p
+
+        const challengeIds = activeChallenges.map(c => c.id)
+        const { data: allCheckins } = await supabase
+          .from('challenge_checkins')
+          .select('*')
+          .in('challenge_id', challengeIds)
+
+        const checkinsByChallenge = {}
+        for (const id of challengeIds) checkinsByChallenge[id] = []
+        for (const ci of allCheckins ?? []) {
+          if (checkinsByChallenge[ci.challenge_id]) checkinsByChallenge[ci.challenge_id].push(ci)
+        }
+
+        setChallenges(activeChallenges.map(c => {
+          const opponentId = c.challenger_id === user.id ? c.opponent_id : c.challenger_id
+          return {
+            ...c,
+            opponentProfile: profileMap[opponentId] ?? null,
+            checkins: checkinsByChallenge[c.id] ?? [],
+          }
+        }))
+      }
+
+      // Pending challenges (where user is opponent)
+      const { data: pendingData } = await supabase
+        .from('habit_challenges')
+        .select('*')
+        .eq('opponent_id', user.id)
+        .eq('status', 'pending')
+
+      if (pendingData && pendingData.length > 0) {
+        const challengerIds = pendingData.map(c => c.challenger_id)
+        const { data: challengerProfiles } = await supabase
+          .from('profiles')
+          .select('id, username, email')
+          .in('id', challengerIds)
+        const cProfileMap = {}
+        for (const p of challengerProfiles ?? []) cProfileMap[p.id] = p
+        setPendingChallenges(pendingData.map(c => ({
+          ...c,
+          challengerProfile: cProfileMap[c.challenger_id] ?? null,
+        })))
+      }
+
+      // Personal habits
       const { data: habitsData } = await supabase
         .from('habits')
         .select('*')
+        .eq('user_id', user.id)
         .order('created_at', { ascending: false })
+      setHabits(habitsData ?? [])
 
-      const habits = habitsData ?? []
-      setHabits(habits)
-
-      if (habits.length > 0) {
+      if (habitsData && habitsData.length > 0) {
         const { data: completionsData } = await supabase
           .from('completions')
           .select('habit_id, completed_date')
           .eq('user_id', user.id)
-          .in('habit_id', habits.map(h => h.id))
-
+          .in('habit_id', habitsData.map(h => h.id))
         const map = {}
-        for (const h of habits) map[h.id] = []
+        for (const h of habitsData) map[h.id] = []
         for (const c of completionsData ?? []) {
           if (map[c.habit_id]) map[c.habit_id].push(c)
         }
-        setCompletions(map)
+        setPersonalCompletions(map)
       }
-
-      const { data: { session } } = await supabase.auth.getSession()
-      const response = await fetch('/api/partner-data', {
-        headers: { 'Authorization': `Bearer ${session.access_token}` }
-      })
-      const partnerData = await response.json()
-      setPartners(partnerData)
-
-      const { data: sentPendingData } = await supabase
-        .from('partnerships')
-        .select('*')
-        .eq('user_id', user.id)
-        .eq('status', 'pending')
-
-      const sentPendingIds = (sentPendingData ?? []).map(p => p.partner_id)
-      let sentPendingEmailMap = {}
-      if (sentPendingIds.length > 0) {
-        const { data: sentPendingProfiles } = await supabase
-          .from('profiles')
-          .select('id, email')
-          .in('id', sentPendingIds)
-        console.log('Sent pending profiles:', sentPendingProfiles)
-        for (const profile of sentPendingProfiles ?? []) {
-          sentPendingEmailMap[profile.id] = profile.email
-        }
-      }
-
-      const sentPendingWithProfiles = (sentPendingData ?? []).map(p => ({
-        id: p.partner_id,
-        email: sentPendingEmailMap[p.partner_id] ?? 'Unknown user',
-      }))
-      setSentPendingPartners(sentPendingWithProfiles)
-
-      const { data: pendingData } = await supabase
-        .from('partnerships')
-        .select('*')
-        .eq('partner_id', user.id)
-        .eq('status', 'pending')
-
-      const inviterIds = (pendingData ?? []).map(p => p.user_id)
-      let inviterEmailMap = {}
-      if (inviterIds.length > 0) {
-        const { data: inviterProfiles } = await supabase
-          .from('profiles')
-          .select('id, email')
-          .in('id', inviterIds)
-        console.log('Inviter profiles:', inviterProfiles)
-        for (const profile of inviterProfiles ?? []) {
-          inviterEmailMap[profile.id] = profile.email
-        }
-      }
-
-      const pendingWithProfiles = (pendingData ?? []).map(p => ({
-        partnershipId: p.id,
-        inviterId: p.user_id,
-        inviterEmail: inviterEmailMap[p.user_id] ?? 'Unknown user',
-      }))
-      setPendingInvites(pendingWithProfiles)
 
       setLoading(false)
     }
@@ -160,7 +170,83 @@ export default function DashboardPage() {
   async function handleSignOut() {
     const supabase = createClient()
     await supabase.auth.signOut()
-    window.location.href = '/login'
+    router.replace('/login')
+  }
+
+  async function handleCheckIn(challenge) {
+    if (checkingIn.has(challenge.id)) return
+    setCheckingIn(prev => new Set(prev).add(challenge.id))
+    const supabase = createClient()
+    const { data: newCheckin } = await supabase
+      .from('challenge_checkins')
+      .insert({ challenge_id: challenge.id, user_id: user.id, checkin_date: todayStr })
+      .select()
+      .single()
+    if (newCheckin) {
+      setChallenges(prev => prev.map(c =>
+        c.id === challenge.id ? { ...c, checkins: [...c.checkins, newCheckin] } : c
+      ))
+    }
+    setCheckingIn(prev => { const n = new Set(prev); n.delete(challenge.id); return n })
+  }
+
+  async function handleAcceptChallenge(challenge) {
+    const supabase = createClient()
+    const today = new Date()
+    const endDate = new Date(today)
+    endDate.setDate(endDate.getDate() + challenge.duration_days)
+    await supabase
+      .from('habit_challenges')
+      .update({ status: 'active', start_date: todayStr, end_date: toDateStr(endDate) })
+      .eq('id', challenge.id)
+    setPendingChallenges(prev => prev.filter(c => c.id !== challenge.id))
+    const supabase2 = createClient()
+    const { data: updated } = await supabase2
+      .from('habit_challenges')
+      .select('*')
+      .eq('id', challenge.id)
+      .single()
+    if (updated) {
+      const opponentId = updated.challenger_id === user.id ? updated.opponent_id : updated.challenger_id
+      const { data: opponentProfiles } = await supabase2
+        .from('profiles')
+        .select('id, username, email')
+        .eq('id', opponentId)
+      const opponentProfile = opponentProfiles?.[0] ?? null
+      setChallenges(prev => [...prev, { ...updated, opponentProfile, checkins: [] }])
+    }
+  }
+
+  async function handleDeclineChallenge(challenge) {
+    const supabase = createClient()
+    await supabase
+      .from('habit_challenges')
+      .update({ status: 'declined' })
+      .eq('id', challenge.id)
+    setPendingChallenges(prev => prev.filter(c => c.id !== challenge.id))
+  }
+
+  async function toggleHabit(habit) {
+    if (togglingHabit.has(habit.id)) return
+    setTogglingHabit(prev => new Set(prev).add(habit.id))
+    const supabase = createClient()
+    const completions = personalCompletions[habit.id] ?? []
+    const doneToday = completions.some(c => c.completed_date === todayStr)
+    if (doneToday) {
+      await supabase.from('completions').delete()
+        .eq('habit_id', habit.id).eq('user_id', user.id).eq('completed_date', todayStr)
+      setPersonalCompletions(prev => ({
+        ...prev,
+        [habit.id]: prev[habit.id].filter(c => c.completed_date !== todayStr),
+      }))
+    } else {
+      await supabase.from('completions').insert({ habit_id: habit.id, user_id: user.id, completed_date: todayStr })
+      setPersonalCompletions(prev => ({
+        ...prev,
+        [habit.id]: [...(prev[habit.id] ?? []), { habit_id: habit.id, completed_date: todayStr }],
+      }))
+    }
+    setTogglingHabit(prev => { const n = new Set(prev); n.delete(habit.id); return n })
   }
 
   async function confirmDeleteHabit() {
@@ -169,321 +255,372 @@ export default function DashboardPage() {
     const supabase = createClient()
     await supabase.from('habits').delete().eq('id', habit.id)
     setHabits(prev => prev.filter(h => h.id !== habit.id))
-    setCompletions(prev => {
-      const next = { ...prev }
-      delete next[habit.id]
-      return next
-    })
-  }
-
-  async function toggleCompletion(habit) {
-    if (toggling.has(habit.id)) return
-    setToggling(prev => new Set(prev).add(habit.id))
-
-    const supabase = createClient()
-    const habitCompletions = completions[habit.id] ?? []
-    const completedToday = habitCompletions.some(c => c.completed_date === todayStr)
-
-    if (completedToday) {
-      await supabase
-        .from('completions')
-        .delete()
-        .eq('habit_id', habit.id)
-        .eq('user_id', user.id)
-        .eq('completed_date', todayStr)
-
-      setCompletions(prev => ({
-        ...prev,
-        [habit.id]: prev[habit.id].filter(c => c.completed_date !== todayStr),
-      }))
-    } else {
-      await supabase
-        .from('completions')
-        .insert({ habit_id: habit.id, user_id: user.id, completed_date: todayStr })
-
-      setCompletions(prev => ({
-        ...prev,
-        [habit.id]: [...(prev[habit.id] ?? []), { habit_id: habit.id, completed_date: todayStr }],
-      }))
-    }
-
-    setToggling(prev => {
-      const next = new Set(prev)
-      next.delete(habit.id)
-      return next
-    })
-  }
-
-  async function handlePendingAction(invite, newStatus) {
-    const supabase = createClient()
-    const { error } = await supabase
-      .from('partnerships')
-      .update({ status: newStatus })
-      .eq('id', invite.partnershipId)
-
-    if (error) return
-
-    setPendingInvites(prev => prev.filter(p => p.partnershipId !== invite.partnershipId))
-
-    if (newStatus === 'active') {
-      const { data: { session } } = await supabase.auth.getSession()
-      const response = await fetch('/api/partner-data', {
-        headers: { 'Authorization': `Bearer ${session.access_token}` }
-      })
-      const partnerData = await response.json()
-      setPartners(partnerData)
-    }
+    setPersonalCompletions(prev => { const n = { ...prev }; delete n[habit.id]; return n })
   }
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-gray-900 flex items-center justify-center">
-        <p className="text-gray-400">Loading...</p>
+      <div style={{ minHeight: '100vh', backgroundColor: '#030712', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ fontSize: 32, marginBottom: 12 }}>🔥</div>
+          <p style={{ color: '#6b7280', fontSize: 14 }}>Loading your dashboard…</p>
+        </div>
       </div>
     )
   }
 
-  const totalStreak = habits.reduce(
-    (sum, habit) => sum + calculateStreak(completions[habit.id] ?? []),
-    0
-  )
+  const displayName = profile?.username ? `@${profile.username}` : (profile?.email ?? user?.email ?? '')
 
   return (
-    <div className="min-h-screen bg-gray-900">
-      <header className="bg-gray-800 border-b border-gray-700">
-        <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
-          <h1 className="text-xl font-bold text-white">Streak</h1>
-          <button
-            onClick={handleSignOut}
-            className="text-sm text-gray-400 hover:text-white transition-colors"
-          >
-            Sign out
-          </button>
+    <div style={{ minHeight: '100vh', backgroundColor: '#030712', color: '#fff', fontFamily: 'system-ui, sans-serif' }}>
+
+      {/* Navbar */}
+      <header style={{
+        position: 'sticky', top: 0, zIndex: 50,
+        backgroundColor: 'rgba(3,7,18,0.85)',
+        backdropFilter: 'blur(16px)',
+        borderBottom: '1px solid rgba(255,255,255,0.06)',
+      }}>
+        <div style={{ maxWidth: 960, margin: '0 auto', padding: '0 20px', height: 60, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <span style={{ fontWeight: 800, fontSize: 20, color: '#f97316', letterSpacing: '-0.01em' }}>Streak 🔥</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+            <span style={{ fontSize: 13, color: '#9ca3af' }}>{displayName}</span>
+            <button
+              onClick={handleSignOut}
+              style={{ fontSize: 13, color: '#6b7280', background: 'none', border: 'none', cursor: 'pointer', padding: '6px 12px', borderRadius: 8, transition: 'color 0.15s' }}
+              onMouseEnter={e => e.target.style.color = '#fff'}
+              onMouseLeave={e => e.target.style.color = '#6b7280'}
+            >
+              Sign out
+            </button>
+          </div>
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto px-4 py-10 space-y-8">
-        <div>
-          <h2 className="text-2xl font-bold text-white">Welcome back</h2>
-          <p className="text-gray-400 mt-1">{user.email}</p>
+      <main style={{ maxWidth: 960, margin: '0 auto', padding: '32px 20px 120px' }}>
+
+        {/* Welcome */}
+        <div style={{ marginBottom: 40 }}>
+          <h1 style={{ fontSize: 28, fontWeight: 800, margin: '0 0 4px', letterSpacing: '-0.02em' }}>
+            Welcome back, {displayName} 🔥
+          </h1>
+          <p style={{ color: '#6b7280', fontSize: 14, margin: 0 }}>
+            {challenges.length} active challenge{challenges.length !== 1 ? 's' : ''}
+          </p>
         </div>
 
-        {habits.length > 0 && (
-          <div className="bg-gray-800 rounded-xl px-6 py-5">
-            <p className="text-gray-400 text-sm uppercase tracking-wide font-semibold mb-1">
-              Total Streak Score
-            </p>
-            <p className="text-4xl font-bold text-orange-500">{totalStreak} 🔥</p>
-          </div>
+        {/* ── Active Challenges ── */}
+        <section style={{ marginBottom: 48 }}>
+          <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', marginBottom: 16 }}>
+            Active Challenges
+          </h2>
+
+          {challenges.length === 0 ? (
+            <EmptyCard>
+              No active challenges yet.{' '}
+              <Link href="/challenges/new" style={{ color: '#f97316', textDecoration: 'none', fontWeight: 600 }}>Start one →</Link>
+            </EmptyCard>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              {challenges.map(challenge => {
+                const opponentId = challenge.challenger_id === user.id ? challenge.opponent_id : challenge.challenger_id
+                const opponentName = challenge.opponentProfile?.username
+                  ? `@${challenge.opponentProfile.username}`
+                  : (challenge.opponentProfile?.email ?? 'Opponent')
+
+                const checkins = challenge.checkins ?? []
+                const myCheckins = checkins.filter(c => c.user_id === user.id)
+                const opponentCheckins = checkins.filter(c => c.user_id === opponentId)
+                const iCheckedIn = myCheckins.some(c => c.checkin_date === todayStr)
+                const theyCheckedIn = opponentCheckins.some(c => c.checkin_date === todayStr)
+                const myStreak = calculateStreak(checkins, user.id)
+                const opponentStreak = calculateStreak(checkins, opponentId)
+                const isCheckingIn = checkingIn.has(challenge.id)
+
+                const start = challenge.start_date ? new Date(challenge.start_date) : new Date()
+                const today = new Date()
+                const dayX = Math.max(1, Math.floor((today - start) / 86400000) + 1)
+                const dayTotal = challenge.duration_days ?? 30
+                const pct = Math.min(100, Math.round((dayX / dayTotal) * 100))
+
+                let statusMsg = '⏰ Check in before midnight!'
+                if (iCheckedIn && !theyCheckedIn) statusMsg = `🏆 ${opponentName} missed today! You're winning`
+                else if (!iCheckedIn && theyCheckedIn) statusMsg = `⚠️ Don't let ${opponentName} win! Check in now`
+                else if (iCheckedIn && theyCheckedIn) statusMsg = '💪 Both on track! Keep going'
+
+                return (
+                  <div key={challenge.id} style={{
+                    backgroundColor: '#0f172a',
+                    border: '1px solid rgba(255,255,255,0.07)',
+                    borderRadius: 20,
+                    padding: '24px 28px',
+                    transition: 'border-color 0.2s',
+                  }}>
+                    {/* Title row */}
+                    <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 16, gap: 12 }}>
+                      <div>
+                        <h3 style={{ fontWeight: 700, fontSize: 17, margin: '0 0 2px' }}>
+                          {challenge.emoji ? `${challenge.emoji} ` : ''}{challenge.habit_name}
+                        </h3>
+                        <p style={{ color: '#6b7280', fontSize: 13, margin: 0 }}>vs {opponentName}</p>
+                      </div>
+                      <span style={{
+                        fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase',
+                        color: '#f97316', backgroundColor: 'rgba(249,115,22,0.1)',
+                        border: '1px solid rgba(249,115,22,0.2)',
+                        padding: '4px 12px', borderRadius: 100, whiteSpace: 'nowrap', flexShrink: 0,
+                      }}>Active</span>
+                    </div>
+
+                    {/* Progress */}
+                    <div style={{ marginBottom: 20 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: '#6b7280', marginBottom: 6 }}>
+                        <span>Day {dayX} of {dayTotal}</span>
+                        <span style={{ color: '#f97316', fontWeight: 600 }}>{pct}%</span>
+                      </div>
+                      <div style={{ height: 6, backgroundColor: 'rgba(255,255,255,0.06)', borderRadius: 100, overflow: 'hidden' }}>
+                        <div style={{ height: '100%', width: `${pct}%`, backgroundColor: '#f97316', borderRadius: 100, boxShadow: '0 0 12px rgba(249,115,22,0.6)' }} />
+                      </div>
+                    </div>
+
+                    {/* Participants */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 20 }}>
+                      {[
+                        { label: displayName, userId: user.id, checkedIn: iCheckedIn, streak: myStreak, isYou: true },
+                        { label: opponentName, userId: opponentId, checkedIn: theyCheckedIn, streak: opponentStreak, isYou: false },
+                      ].map(({ label, checkedIn, streak, isYou }) => (
+                        <div key={label} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                            <div style={{
+                              width: 24, height: 24, borderRadius: '50%',
+                              backgroundColor: checkedIn ? '#16a34a' : 'rgba(255,255,255,0.08)',
+                              border: checkedIn ? '2px solid #16a34a' : '2px solid rgba(255,255,255,0.12)',
+                              display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                            }}>
+                              {checkedIn && <span style={{ fontSize: 12 }}>✓</span>}
+                            </div>
+                            <span style={{ fontSize: 14, fontWeight: isYou ? 600 : 400, color: isYou ? '#fff' : '#9ca3af' }}>{label}</span>
+                          </div>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: '#f97316' }}>{streak} 🔥</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Status + Button */}
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                      <p style={{ fontSize: 13, color: '#9ca3af', margin: 0 }}>{statusMsg}</p>
+                      {iCheckedIn ? (
+                        <button disabled style={{
+                          fontSize: 13, fontWeight: 700, padding: '9px 20px', borderRadius: 12,
+                          backgroundColor: 'rgba(22,163,74,0.15)', border: '1px solid rgba(22,163,74,0.3)',
+                          color: '#4ade80', cursor: 'default',
+                        }}>
+                          Checked In ✅
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => handleCheckIn(challenge)}
+                          disabled={isCheckingIn}
+                          style={{
+                            fontSize: 13, fontWeight: 700, padding: '9px 20px', borderRadius: 12,
+                            backgroundColor: isCheckingIn ? 'rgba(249,115,22,0.4)' : '#f97316',
+                            border: 'none', color: '#fff', cursor: isCheckingIn ? 'default' : 'pointer',
+                            boxShadow: '0 4px 16px rgba(249,115,22,0.35)', transition: 'background 0.15s',
+                          }}
+                        >
+                          {isCheckingIn ? 'Checking in…' : 'Check In'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </section>
+
+        {/* ── Pending Challenges ── */}
+        {pendingChallenges.length > 0 && (
+          <section style={{ marginBottom: 48 }}>
+            <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', marginBottom: 16 }}>
+              Pending Challenges
+            </h2>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {pendingChallenges.map(challenge => {
+                const challengerName = challenge.challengerProfile?.username
+                  ? `@${challenge.challengerProfile.username}`
+                  : (challenge.challengerProfile?.email ?? 'Someone')
+                return (
+                  <div key={challenge.id} style={{
+                    backgroundColor: '#0f172a',
+                    border: '1px solid rgba(249,115,22,0.15)',
+                    borderRadius: 16,
+                    padding: '20px 24px',
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap',
+                  }}>
+                    <div>
+                      <p style={{ fontWeight: 600, fontSize: 15, margin: '0 0 2px' }}>
+                        {challengerName} challenged you to <span style={{ color: '#f97316' }}>{challenge.habit_name}</span>
+                      </p>
+                      <p style={{ color: '#6b7280', fontSize: 13, margin: 0 }}>{challenge.duration_days}-day challenge</p>
+                    </div>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button
+                        onClick={() => handleDeclineChallenge(challenge)}
+                        style={{
+                          fontSize: 13, fontWeight: 600, padding: '8px 16px', borderRadius: 10,
+                          backgroundColor: 'transparent', border: '1px solid rgba(255,255,255,0.12)',
+                          color: '#9ca3af', cursor: 'pointer', transition: 'border-color 0.15s',
+                        }}
+                      >
+                        Decline
+                      </button>
+                      <button
+                        onClick={() => handleAcceptChallenge(challenge)}
+                        style={{
+                          fontSize: 13, fontWeight: 700, padding: '8px 20px', borderRadius: 10,
+                          backgroundColor: '#f97316', border: 'none', color: '#fff', cursor: 'pointer',
+                          boxShadow: '0 4px 14px rgba(249,115,22,0.35)', transition: 'background 0.15s',
+                        }}
+                      >
+                        Accept
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </section>
         )}
 
+        {/* ── Personal Habits ── */}
         <section>
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold text-white">My Habits</h3>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+            <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', margin: 0 }}>
+              Personal Habits
+            </h2>
             <Link
               href="/habits/new"
-              className="bg-orange-500 hover:bg-orange-600 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors"
+              style={{
+                fontSize: 13, fontWeight: 700, padding: '7px 16px', borderRadius: 10,
+                backgroundColor: '#f97316', color: '#fff', textDecoration: 'none',
+                boxShadow: '0 4px 14px rgba(249,115,22,0.3)',
+              }}
             >
-              Add Habit
+              + Add Habit
             </Link>
           </div>
 
           {habits.length === 0 ? (
-            <div className="bg-gray-800 rounded-xl p-10 text-center">
-              <p className="text-gray-400">No habits yet. Add your first habit!</p>
-            </div>
+            <EmptyCard>No personal habits yet. <Link href="/habits/new" style={{ color: '#f97316', textDecoration: 'none', fontWeight: 600 }}>Add one →</Link></EmptyCard>
           ) : (
-            <ul className="space-y-3">
-              {habits.map((habit) => {
-                const habitCompletions = completions[habit.id] ?? []
-                const completedToday = habitCompletions.some(c => c.completed_date === todayStr)
-                const streak = calculateStreak(habitCompletions)
-                const isToggling = toggling.has(habit.id)
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {habits.map(habit => {
+                const completions = personalCompletions[habit.id] ?? []
+                const doneToday = completions.some(c => c.completed_date === todayStr)
+                const streak = calculatePersonalStreak(completions)
+                const isToggling = togglingHabit.has(habit.id)
 
                 return (
-                  <li
+                  <div
                     key={habit.id}
-                    className={`group bg-gray-800 rounded-xl px-5 py-4 flex items-center justify-between transition-all ${
-                      completedToday ? 'border border-green-600/40' : 'border border-transparent'
-                    }`}
+                    className="habit-row"
+                    style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                      backgroundColor: '#0f172a',
+                      border: doneToday ? '1px solid rgba(22,163,74,0.3)' : '1px solid rgba(255,255,255,0.06)',
+                      borderRadius: 14, padding: '14px 18px',
+                    }}
                   >
-                    <div className="flex items-center gap-4">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                       <button
-                        onClick={() => toggleCompletion(habit)}
+                        onClick={() => toggleHabit(habit)}
                         disabled={isToggling}
-                        aria-label={completedToday ? 'Mark incomplete' : 'Mark complete'}
-                        className={`w-7 h-7 rounded-full border-2 flex items-center justify-center flex-shrink-0 transition-colors ${
-                          completedToday
-                            ? 'bg-green-500 border-green-500 text-white'
-                            : 'border-gray-500 hover:border-orange-500'
-                        } ${isToggling ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                        style={{
+                          width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
+                          backgroundColor: doneToday ? '#16a34a' : 'transparent',
+                          border: doneToday ? '2px solid #16a34a' : '2px solid rgba(255,255,255,0.2)',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          cursor: isToggling ? 'default' : 'pointer', transition: 'all 0.15s', padding: 0,
+                        }}
                       >
-                        {completedToday && (
-                          <svg
-                            className="w-4 h-4"
-                            fill="none"
-                            viewBox="0 0 24 24"
-                            stroke="currentColor"
-                            strokeWidth={3}
-                          >
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                          </svg>
-                        )}
+                        {doneToday && <span style={{ fontSize: 13, color: '#fff' }}>✓</span>}
                       </button>
-                      <span className={`font-medium ${completedToday ? 'text-green-400' : 'text-white'}`}>
+                      <span style={{ fontSize: 15, fontWeight: 500, color: doneToday ? '#4ade80' : '#fff' }}>
                         {habit.name}
                       </span>
                     </div>
-                    <div className="flex items-center gap-3">
-                      <span className="text-xl font-bold text-orange-500">{streak}</span>
-                      <span className="text-xl">🔥</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <span style={{ fontWeight: 700, color: '#f97316', fontSize: 15 }}>{streak} 🔥</span>
                       <button
                         onClick={() => setHabitToDelete(habit)}
-                        aria-label="Delete habit"
-                        className="opacity-0 group-hover:opacity-100 transition-opacity text-red-500 hover:text-red-400 p-1"
+                        className="delete-btn"
+                        style={{
+                          background: 'none', border: 'none', cursor: 'pointer',
+                          color: '#ef4444', padding: '4px', borderRadius: 6, display: 'flex', opacity: 0, transition: 'opacity 0.15s',
+                        }}
                       >
-                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                           <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                         </svg>
                       </button>
                     </div>
-                  </li>
+                  </div>
                 )
               })}
-            </ul>
-          )}
-        </section>
-
-        {pendingInvites.length > 0 && (
-          <section>
-            <h3 className="text-lg font-semibold text-white mb-4">Pending Invites</h3>
-            <ul className="space-y-3">
-              {pendingInvites.map((invite) => (
-                <li key={invite.partnershipId} className="bg-gray-800 rounded-xl px-5 py-4 flex items-center justify-between">
-                  <div>
-                    <p className="font-medium text-white">{invite.inviterEmail}</p>
-                  </div>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => handlePendingAction(invite, 'declined')}
-                      className="px-3 py-1.5 rounded-lg border border-gray-600 text-gray-300 hover:text-white hover:border-gray-400 transition-colors text-sm font-semibold"
-                    >
-                      Decline
-                    </button>
-                    <button
-                      onClick={() => handlePendingAction(invite, 'active')}
-                      className="px-3 py-1.5 rounded-lg bg-orange-500 hover:bg-orange-600 text-white transition-colors text-sm font-semibold"
-                    >
-                      Accept
-                    </button>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
-
-        <section>
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold text-white">Partners</h3>
-            <Link
-              href="/partners/invite"
-              className="bg-orange-500 hover:bg-orange-600 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors"
-            >
-              Invite Partner
-            </Link>
-          </div>
-
-          {partners.length === 0 && sentPendingPartners.length === 0 ? (
-            <div className="bg-gray-800 rounded-xl p-10 text-center">
-              <p className="text-gray-400">No active partners yet. Invite someone to keep each other accountable!</p>
             </div>
-          ) : (
-            <ul className="space-y-3">
-              {partners.map((partner) => (
-                <li key={partner.id} className="bg-gray-800 rounded-xl px-5 py-4">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className="font-medium text-white">{partner.email}</span>
-                      <span className="px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 text-xs font-semibold">Active</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xl font-bold text-orange-500">{partner.totalStreak}</span>
-                      <span className="text-xl">🔥</span>
-                    </div>
-                  </div>
-                  {partner.habits && partner.habits.length > 0 && (
-                    <ul className="mt-3 space-y-2">
-                      {partner.habits.map((habit) => (
-                        <li key={habit.id} className="flex items-center justify-between py-1">
-                          <div className="flex items-center gap-3">
-                            <div className={`w-6 h-6 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
-                              habit.completedToday ? 'bg-green-500 border-green-500 text-white' : 'border-gray-500'
-                            }`}>
-                              {habit.completedToday && (
-                                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                                </svg>
-                              )}
-                            </div>
-                            <span className={`text-sm ${habit.completedToday ? 'text-green-400' : 'text-gray-300'}`}>
-                              {habit.name}
-                            </span>
-                          </div>
-                          <div className="flex items-center gap-1">
-                            <span className="font-bold text-orange-500">{habit.streak}</span>
-                            <span>🔥</span>
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </li>
-              ))}
-              {sentPendingPartners.map((partner) => (
-                <li key={partner.id} className="bg-gray-800 rounded-xl px-5 py-4 flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="font-medium text-white">{partner.email}</span>
-                    <span className="px-2 py-0.5 rounded-full bg-yellow-500/20 text-yellow-400 text-xs font-semibold">Pending</span>
-                  </div>
-                  <div />
-                </li>
-              ))}
-            </ul>
           )}
         </section>
       </main>
 
+      {/* Floating New Challenge Button */}
+      <Link
+        href="/challenges/new"
+        style={{
+          position: 'fixed', bottom: 28, right: 28,
+          display: 'flex', alignItems: 'center', gap: 8,
+          backgroundColor: '#f97316', color: '#fff',
+          fontWeight: 700, fontSize: 14, textDecoration: 'none',
+          padding: '14px 22px', borderRadius: 50,
+          boxShadow: '0 8px 28px rgba(249,115,22,0.45)',
+          transition: 'transform 0.15s, box-shadow 0.15s',
+          zIndex: 40,
+        }}
+        onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.boxShadow = '0 12px 36px rgba(249,115,22,0.55)' }}
+        onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 8px 28px rgba(249,115,22,0.45)' }}
+      >
+        ⚔️ New Challenge
+      </Link>
+
+      {/* Delete Habit Modal */}
       {habitToDelete && (
         <div
-          className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 px-4"
           onClick={() => setHabitToDelete(null)}
+          style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 60, padding: 16 }}
         >
           <div
-            className="bg-gray-800 rounded-2xl p-8 max-w-sm w-full flex flex-col items-center gap-4"
             onClick={e => e.stopPropagation()}
+            style={{ backgroundColor: '#0f172a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 20, padding: 32, maxWidth: 360, width: '100%', textAlign: 'center' }}
           >
-            <div className="w-14 h-14 rounded-full bg-red-500/10 flex items-center justify-center">
-              <svg className="w-7 h-7 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <div style={{ width: 52, height: 52, borderRadius: '50%', backgroundColor: 'rgba(239,68,68,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+              <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="#ef4444" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
               </svg>
             </div>
-            <h2 className="text-xl font-bold text-white">Delete Habit</h2>
-            <p className="text-gray-400 text-center text-sm">
-              Are you sure you want to delete{' '}
-              <span className="text-orange-500 font-semibold">{habitToDelete.name}</span>
-              ? All your streak data will be lost forever.
+            <h3 style={{ fontWeight: 700, fontSize: 18, margin: '0 0 8px' }}>Delete Habit</h3>
+            <p style={{ color: '#9ca3af', fontSize: 14, margin: '0 0 24px', lineHeight: 1.6 }}>
+              Delete <span style={{ color: '#f97316', fontWeight: 600 }}>{habitToDelete.name}</span>? All streak data will be lost.
             </p>
-            <div className="flex gap-3 w-full mt-2">
+            <div style={{ display: 'flex', gap: 10 }}>
               <button
                 onClick={() => setHabitToDelete(null)}
-                className="flex-1 px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white hover:border-gray-400 transition-colors text-sm font-semibold"
+                style={{ flex: 1, padding: '10px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.1)', backgroundColor: 'transparent', color: '#9ca3af', cursor: 'pointer', fontWeight: 600, fontSize: 14 }}
               >
                 Cancel
               </button>
               <button
                 onClick={confirmDeleteHabit}
-                className="flex-1 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white transition-colors text-sm font-semibold"
+                style={{ flex: 1, padding: '10px', borderRadius: 12, border: 'none', backgroundColor: '#dc2626', color: '#fff', cursor: 'pointer', fontWeight: 700, fontSize: 14 }}
               >
                 Delete
               </button>
@@ -491,6 +628,23 @@ export default function DashboardPage() {
           </div>
         </div>
       )}
+
+      <style>{`
+        .habit-row:hover .delete-btn { opacity: 1 !important; }
+      `}</style>
+    </div>
+  )
+}
+
+function EmptyCard({ children }) {
+  return (
+    <div style={{
+      backgroundColor: '#0f172a',
+      border: '1px solid rgba(255,255,255,0.06)',
+      borderRadius: 16, padding: '32px 24px',
+      textAlign: 'center', color: '#6b7280', fontSize: 14,
+    }}>
+      {children}
     </div>
   )
 }
