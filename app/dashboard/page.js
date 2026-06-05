@@ -77,6 +77,7 @@ export default function DashboardPage() {
         .select('id, username, email')
         .eq('id', user.id)
         .maybeSingle()
+
       setProfile(profileData)
 
       // Active challenges
@@ -150,7 +151,7 @@ export default function DashboardPage() {
 
       if (habitsData && habitsData.length > 0) {
         const { data: completionsData } = await supabase
-          .from('completions')
+          .from('personal_completions')
           .select('habit_id, completed_date')
           .eq('user_id', user.id)
           .in('habit_id', habitsData.map(h => h.id))
@@ -233,14 +234,14 @@ export default function DashboardPage() {
     const completions = personalCompletions[habit.id] ?? []
     const doneToday = completions.some(c => c.completed_date === todayStr)
     if (doneToday) {
-      await supabase.from('completions').delete()
+      await supabase.from('personal_completions').delete()
         .eq('habit_id', habit.id).eq('user_id', user.id).eq('completed_date', todayStr)
       setPersonalCompletions(prev => ({
         ...prev,
         [habit.id]: prev[habit.id].filter(c => c.completed_date !== todayStr),
       }))
     } else {
-      await supabase.from('completions').insert({ habit_id: habit.id, user_id: user.id, completed_date: todayStr })
+      await supabase.from('personal_completions').insert({ habit_id: habit.id, user_id: user.id, completed_date: todayStr })
       setPersonalCompletions(prev => ({
         ...prev,
         [habit.id]: [...(prev[habit.id] ?? []), { habit_id: habit.id, completed_date: todayStr }],
@@ -269,7 +270,7 @@ export default function DashboardPage() {
     )
   }
 
-  const displayName = profile?.username ? `@${profile.username}` : (profile?.email ?? user?.email ?? '')
+  const displayName = profile?.username ? `${profile.username}` : (user?.email ?? '')
 
   return (
     <div style={{ minHeight: '100vh', backgroundColor: '#030712', color: '#fff', fontFamily: 'system-ui, sans-serif' }}>

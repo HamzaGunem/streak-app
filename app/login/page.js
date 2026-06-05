@@ -28,7 +28,7 @@ function LoginForm() {
       return
     }
 
-    router.replace(redirect ?? '/dashboard')
+    window.location.replace(redirect ?? '/dashboard')
   }
 
   return (
