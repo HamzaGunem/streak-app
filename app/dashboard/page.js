@@ -284,8 +284,23 @@ export default function DashboardPage() {
       }}>
         <div style={{ maxWidth: 960, margin: '0 auto', padding: '0 20px', height: 60, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <span style={{ fontWeight: 800, fontSize: 20, color: '#f97316', letterSpacing: '-0.01em' }}>Streak 🔥</span>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-            <span style={{ fontSize: 13, color: '#9ca3af' }}>{displayName}</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <Link
+              href="/profile"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 7,
+                textDecoration: 'none',
+                padding: '5px 10px', borderRadius: 10,
+                border: '1px solid rgba(255,255,255,0.08)',
+                backgroundColor: 'rgba(255,255,255,0.03)',
+                transition: 'border-color 0.15s, background-color 0.15s',
+              }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(249,115,22,0.35)'; e.currentTarget.style.backgroundColor = 'rgba(249,115,22,0.07)' }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.08)'; e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.03)' }}
+            >
+              <span style={{ fontSize: 16, lineHeight: 1 }}>{profile?.avatar || '🔥'}</span>
+              <span style={{ fontSize: 13, color: '#9ca3af', fontWeight: 500 }}>{displayName}</span>
+            </Link>
             <button
               onClick={handleSignOut}
               style={{ fontSize: 13, color: '#6b7280', background: 'none', border: 'none', cursor: 'pointer', padding: '6px 12px', borderRadius: 8, transition: 'color 0.15s' }}

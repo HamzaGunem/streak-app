@@ -20,6 +20,7 @@ const DURATIONS = [7, 14, 30, 60]
 
 export default function NewChallengePage() {
   const [user, setUser] = useState(null)
+  const [challengerProfile, setChallengerProfile] = useState(null)
   const [habitName, setHabitName] = useState('')
   const [duration, setDuration] = useState(30)
   const [opponent, setOpponent] = useState('')
@@ -33,6 +34,13 @@ export default function NewChallengePage() {
       const { data: { user } } = await supabase.auth.getUser()
       if (!user) { router.replace('/login'); return }
       setUser(user)
+
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('id, username, email')
+        .eq('id', user.id)
+        .maybeSingle()
+      setChallengerProfile(profile)
     }
     checkAuth()
   }, [router])
@@ -91,7 +99,7 @@ export default function NewChallengePage() {
       return
     }
 
-    const { error: insertError } = await supabase
+    const { data: newChallenge, error: insertError } = await supabase
       .from('habit_challenges')
       .insert({
         habit_name: trimmedHabit,
@@ -100,11 +108,28 @@ export default function NewChallengePage() {
         status: 'pending',
         duration_days: duration,
       })
+      .select()
+      .single()
 
     if (insertError) {
       setError('Something went wrong. Please try again.')
       setLoading(false)
       return
+    }
+
+    if (newChallenge) {
+      fetch('/api/challenge-invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          opponent_email: opponentProfile.email,
+          opponent_username: opponentProfile.username ?? '',
+          challenger_username: challengerProfile?.username ?? user.email,
+          habit_name: trimmedHabit,
+          duration_days: duration,
+          challenge_id: newChallenge.id,
+        }),
+      }).catch(err => console.error('Email invite failed:', err))
     }
 
     router.replace('/dashboard')
