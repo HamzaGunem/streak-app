@@ -4,6 +4,7 @@ import { useEffect, useState, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase'
+import { BADGES, checkAndAwardBadges } from '@/lib/badges'
 
 const AVATAR_OPTIONS = ['🔥', '⚡', '🏆', '💪', '🎯', '🚀', '👑', '⭐']
 
@@ -30,6 +31,9 @@ export default function ProfilePage() {
   const [profile, setProfile]                 = useState(null)
   const [challenges, setChallenges]           = useState([])
   const [opponentMap, setOpponentMap]         = useState({})
+  const [rivals, setRivals]                   = useState([])
+  const [rivalProfiles, setRivalProfiles]     = useState({})
+  const [earnedBadges, setEarnedBadges]       = useState(new Set())
   const [loading, setLoading]                 = useState(true)
   const [editingUsername, setEditingUsername] = useState(false)
   const [usernameInput, setUsernameInput]     = useState('')
@@ -53,6 +57,16 @@ export default function ProfilePage() {
         .maybeSingle()
       setProfile(profileData)
 
+      // Load earned badges from profile
+      setEarnedBadges(new Set(profileData?.badges ?? []))
+
+      // Check for newly earned badges (fire and forget)
+      checkAndAwardBadges(user.id, supabase).then(newBadges => {
+        if (newBadges.length > 0) {
+          setEarnedBadges(prev => new Set([...prev, ...newBadges]))
+        }
+      }).catch(() => {})
+
       const { data: challengesData } = await supabase
         .from('habit_challenges')
         .select('*')
@@ -73,6 +87,25 @@ export default function ProfilePage() {
         const map = {}
         for (const p of oppProfiles ?? []) map[p.id] = p
         setOpponentMap(map)
+      }
+
+      // Load rivals
+      const { data: rivalsData } = await supabase
+        .from('rivalries')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('total_challenges', { ascending: false })
+
+      if (rivalsData && rivalsData.length > 0) {
+        setRivals(rivalsData)
+        const rivalIds = rivalsData.map(r => r.rival_id)
+        const { data: rProfiles } = await supabase
+          .from('profiles')
+          .select('id, username, email')
+          .in('id', rivalIds)
+        const rMap = {}
+        for (const p of rProfiles ?? []) rMap[p.id] = p
+        setRivalProfiles(rMap)
       }
 
       setLoading(false)
@@ -185,7 +218,6 @@ export default function ProfilePage() {
             margin: '0 auto 20px',
             fontSize: 48,
             boxShadow: '0 0 40px rgba(249,115,22,0.12), 0 8px 32px rgba(0,0,0,0.4)',
-            position: 'relative',
           }}>
             {avatar}
           </div>
@@ -309,6 +341,111 @@ export default function ProfilePage() {
             ))}
           </div>
         </section>
+
+        {/* ── ACHIEVEMENTS ── */}
+        <section style={{ marginBottom: 40 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+            <h2 style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', margin: 0 }}>
+              Achievements
+            </h2>
+            <span style={{ fontSize: 12, color: '#4b5563', fontWeight: 500 }}>
+              {earnedBadges.size}/{BADGES.length} unlocked
+            </span>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            {BADGES.map(badge => {
+              const isEarned = earnedBadges.has(badge.id)
+              return (
+                <div key={badge.id} style={{
+                  backgroundColor: '#0f172a',
+                  border: isEarned ? '1px solid rgba(249,115,22,0.3)' : '1px solid rgba(255,255,255,0.06)',
+                  borderRadius: 16,
+                  padding: '16px 18px',
+                  display: 'flex', alignItems: 'center', gap: 14,
+                  boxShadow: isEarned ? '0 0 20px rgba(249,115,22,0.07)' : 'none',
+                  opacity: isEarned ? 1 : 0.45,
+                  transition: 'all 0.15s',
+                }}>
+                  <span style={{ fontSize: 28, lineHeight: 1, flexShrink: 0, filter: isEarned ? 'none' : 'grayscale(1)' }}>
+                    {isEarned ? badge.emoji : '🔒'}
+                  </span>
+                  <div style={{ minWidth: 0 }}>
+                    <p style={{ fontWeight: 600, fontSize: 13, margin: '0 0 2px', color: isEarned ? '#fff' : '#6b7280' }}>
+                      {badge.name}
+                    </p>
+                    <p style={{ fontSize: 11, color: '#4b5563', margin: 0, lineHeight: 1.4 }}>
+                      {badge.desc}
+                    </p>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </section>
+
+        {/* ── RIVALS ── */}
+        {rivals.length > 0 && (
+          <section style={{ marginBottom: 40 }}>
+            <h2 style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', margin: '0 0 16px' }}>
+              Your Rivals
+            </h2>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {rivals.map(rivalry => {
+                const rProfile = rivalProfiles[rivalry.rival_id]
+                const rName    = rProfile?.username ? `@${rProfile.username}` : (rProfile?.email ?? 'Unknown')
+                const iLead    = rivalry.user_wins > rivalry.rival_wins
+                const theyLead = rivalry.rival_wins > rivalry.user_wins
+
+                return (
+                  <div key={rivalry.id} style={{
+                    backgroundColor: '#0f172a',
+                    border: '1px solid rgba(255,255,255,0.07)',
+                    borderRadius: 16,
+                    padding: '18px 20px',
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap',
+                  }}>
+                    <div>
+                      <p style={{ fontWeight: 600, fontSize: 15, margin: '0 0 4px' }}>{rName}</p>
+                      <p style={{ fontSize: 13, color: '#6b7280', margin: 0 }}>
+                        <span style={{ color: iLead ? '#4ade80' : theyLead ? '#f87171' : '#9ca3af', fontWeight: 600 }}>
+                          You {rivalry.user_wins}
+                        </span>
+                        {' — '}
+                        <span style={{ color: theyLead ? '#f87171' : '#9ca3af', fontWeight: 600 }}>
+                          {rivalry.rival_wins} {rName}
+                        </span>
+                        <span style={{ color: '#374151' }}> · {rivalry.total_challenges} matches</span>
+                      </p>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <span style={{
+                        fontSize: 12, fontWeight: 600,
+                        color: iLead ? '#4ade80' : theyLead ? '#f87171' : '#9ca3af',
+                      }}>
+                        {iLead ? 'You lead' : theyLead ? 'They lead' : 'Tied'}
+                      </span>
+                      {rProfile?.username && (
+                        <Link
+                          href={`/challenges/new?opponent=${rProfile.username}`}
+                          style={{
+                            fontSize: 12, fontWeight: 700, padding: '6px 14px', borderRadius: 10,
+                            backgroundColor: 'rgba(249,115,22,0.1)', border: '1px solid rgba(249,115,22,0.25)',
+                            color: '#f97316', textDecoration: 'none', whiteSpace: 'nowrap',
+                            transition: 'background 0.15s',
+                          }}
+                          onMouseEnter={e => e.currentTarget.style.backgroundColor = 'rgba(249,115,22,0.2)'}
+                          onMouseLeave={e => e.currentTarget.style.backgroundColor = 'rgba(249,115,22,0.1)'}
+                        >
+                          Challenge Again ⚔️
+                        </Link>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </section>
+        )}
 
         {/* ── AVATAR PICKER ── */}
         <section style={{ marginBottom: 40 }}>

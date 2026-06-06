@@ -74,40 +74,79 @@ export default function DashboardPage() {
 
       const { data: profileData } = await supabase
         .from('profiles')
-        .select('id, username, email')
+        .select('id, username, email, avatar')
         .eq('id', user.id)
         .maybeSingle()
-
       setProfile(profileData)
 
-      // Active challenges
-      const { data: activeChallenges } = await supabase
-        .from('habit_challenges')
-        .select('*')
-        .or(`challenger_id.eq.${user.id},opponent_id.eq.${user.id}`)
-        .eq('status', 'active')
+      // Fetch active challenges (direct) + pending main-opponent invites + group participation via API
+      const [
+        { data: directActive },
+        { data: pendingAsOpp },
+        groupInvitesRes,
+      ] = await Promise.all([
+        supabase.from('habit_challenges').select('*')
+          .or(`challenger_id.eq.${user.id},opponent_id.eq.${user.id}`)
+          .eq('status', 'active'),
+        supabase.from('habit_challenges').select('*')
+          .eq('opponent_id', user.id).eq('status', 'pending'),
+        fetch(`/api/group-invites?user_id=${user.id}`).then(r => r.json()).catch(() => ({ pending: [], activeIds: [] })),
+      ])
 
-      if (activeChallenges && activeChallenges.length > 0) {
+      const { pending: pendingAsGroup, active: groupActive } = groupInvitesRes
+
+      // Merge group-participant active challenges (avoid duplicates with direct)
+      const directActiveIds = new Set((directActive ?? []).map(c => c.id))
+      const activeChallenges = [
+        ...(directActive ?? []),
+        ...(groupActive ?? []).filter(c => !directActiveIds.has(c.id)),
+      ]
+
+      if (activeChallenges.length > 0) {
+        const challengeIds = activeChallenges.map(c => c.id)
+
+        // Primary "opponent" for each challenge (for solo display)
         const opponentIds = activeChallenges.map(c =>
           c.challenger_id === user.id ? c.opponent_id : c.challenger_id
         )
-        const { data: opponentProfiles } = await supabase
-          .from('profiles')
-          .select('id, username, email')
-          .in('id', opponentIds)
+
+        const [{ data: opponentProfiles }, { data: allCheckins }, { data: allParticipants }] = await Promise.all([
+          supabase.from('profiles').select('id, username, email').in('id', opponentIds),
+          supabase.from('challenge_checkins').select('*').in('challenge_id', challengeIds),
+          supabase.from('challenge_participants').select('challenge_id, user_id, status').in('challenge_id', challengeIds),
+        ])
+
         const profileMap = {}
         for (const p of opponentProfiles ?? []) profileMap[p.id] = p
 
-        const challengeIds = activeChallenges.map(c => c.id)
-        const { data: allCheckins } = await supabase
-          .from('challenge_checkins')
-          .select('*')
-          .in('challenge_id', challengeIds)
+        // Fetch extra profiles: for group challenges fetch challenger + opponent + all participants
+        const extraIds = new Set()
+        for (const c of activeChallenges) {
+          if ((c.max_participants ?? 2) > 2) {
+            if (!profileMap[c.challenger_id] && c.challenger_id !== user.id) extraIds.add(c.challenger_id)
+            if (c.opponent_id && !profileMap[c.opponent_id] && c.opponent_id !== user.id) extraIds.add(c.opponent_id)
+          }
+        }
+        for (const p of allParticipants ?? []) {
+          if (!profileMap[p.user_id] && p.user_id !== user.id) extraIds.add(p.user_id)
+        }
+        if (extraIds.size > 0) {
+          const { data: extraProfiles } = await supabase
+            .from('profiles').select('id, username, email').in('id', [...extraIds])
+          for (const p of extraProfiles ?? []) profileMap[p.id] = p
+        }
 
         const checkinsByChallenge = {}
-        for (const id of challengeIds) checkinsByChallenge[id] = []
+        const participantsByChallenge = {}
+        for (const id of challengeIds) {
+          checkinsByChallenge[id] = []
+          participantsByChallenge[id] = []
+        }
         for (const ci of allCheckins ?? []) {
           if (checkinsByChallenge[ci.challenge_id]) checkinsByChallenge[ci.challenge_id].push(ci)
+        }
+        for (const p of allParticipants ?? []) {
+          if (participantsByChallenge[p.challenge_id]) participantsByChallenge[p.challenge_id].push(p)
         }
 
         setChallenges(activeChallenges.map(c => {
@@ -115,27 +154,30 @@ export default function DashboardPage() {
           return {
             ...c,
             opponentProfile: profileMap[opponentId] ?? null,
+            mainOpponentProfile: profileMap[c.opponent_id] ?? null,
+            challengerProfile: profileMap[c.challenger_id] ?? null,
             checkins: checkinsByChallenge[c.id] ?? [],
+            groupParticipants: (participantsByChallenge[c.id] ?? []).map(p => ({
+              ...p,
+              profile: profileMap[p.user_id] ?? null,
+            })),
           }
         }))
       }
 
-      // Pending challenges (where user is opponent)
-      const { data: pendingData } = await supabase
-        .from('habit_challenges')
-        .select('*')
-        .eq('opponent_id', user.id)
-        .eq('status', 'pending')
+      // Build pending list: main opponent invites + group participant invites (from API)
+      const allPending = [
+        ...(pendingAsOpp ?? []).map(c => ({ ...c, isGroupParticipant: false })),
+        ...pendingAsGroup,
+      ]
 
-      if (pendingData && pendingData.length > 0) {
-        const challengerIds = pendingData.map(c => c.challenger_id)
+      if (allPending.length > 0) {
+        const challengerIds = allPending.map(c => c.challenger_id)
         const { data: challengerProfiles } = await supabase
-          .from('profiles')
-          .select('id, username, email')
-          .in('id', challengerIds)
+          .from('profiles').select('id, username, email').in('id', challengerIds)
         const cProfileMap = {}
         for (const p of challengerProfiles ?? []) cProfileMap[p.id] = p
-        setPendingChallenges(pendingData.map(c => ({
+        setPendingChallenges(allPending.map(c => ({
           ...c,
           challengerProfile: cProfileMap[c.challenger_id] ?? null,
         })))
@@ -143,9 +185,7 @@ export default function DashboardPage() {
 
       // Personal habits
       const { data: habitsData } = await supabase
-        .from('habits')
-        .select('*')
-        .eq('user_id', user.id)
+        .from('habits').select('*').eq('user_id', user.id)
         .order('created_at', { ascending: false })
       setHabits(habitsData ?? [])
 
@@ -193,6 +233,19 @@ export default function DashboardPage() {
 
   async function handleAcceptChallenge(challenge) {
     const supabase = createClient()
+
+    if (challenge.isGroupParticipant) {
+      await fetch('/api/group-invites', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ challenge_id: challenge.id, user_id: user.id, status: 'accepted' }),
+      })
+      setPendingChallenges(prev => prev.filter(c => c.id !== challenge.id))
+      router.push(`/challenges/${challenge.id}`)
+      return
+    }
+
+    // Main opponent accepting: start the challenge
     const today = new Date()
     const endDate = new Date(today)
     endDate.setDate(endDate.getDate() + challenge.duration_days)
@@ -203,27 +256,38 @@ export default function DashboardPage() {
     setPendingChallenges(prev => prev.filter(c => c.id !== challenge.id))
     const supabase2 = createClient()
     const { data: updated } = await supabase2
-      .from('habit_challenges')
-      .select('*')
-      .eq('id', challenge.id)
-      .single()
+      .from('habit_challenges').select('*').eq('id', challenge.id).single()
     if (updated) {
       const opponentId = updated.challenger_id === user.id ? updated.opponent_id : updated.challenger_id
       const { data: opponentProfiles } = await supabase2
-        .from('profiles')
-        .select('id, username, email')
-        .eq('id', opponentId)
+        .from('profiles').select('id, username, email').eq('id', opponentId)
       const opponentProfile = opponentProfiles?.[0] ?? null
-      setChallenges(prev => [...prev, { ...updated, opponentProfile, checkins: [] }])
+      setChallenges(prev => [...prev, {
+        ...updated,
+        opponentProfile,
+        mainOpponentProfile: opponentProfile,
+        challengerProfile: null,
+        checkins: [],
+        groupParticipants: [],
+      }])
     }
   }
 
   async function handleDeclineChallenge(challenge) {
     const supabase = createClient()
-    await supabase
-      .from('habit_challenges')
-      .update({ status: 'declined' })
-      .eq('id', challenge.id)
+
+    if (challenge.isGroupParticipant) {
+      await fetch('/api/group-invites', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ challenge_id: challenge.id, user_id: user.id, status: 'declined' }),
+      })
+    } else {
+      await supabase
+        .from('habit_challenges')
+        .update({ status: 'declined' })
+        .eq('id', challenge.id)
+    }
     setPendingChallenges(prev => prev.filter(c => c.id !== challenge.id))
   }
 
@@ -339,6 +403,7 @@ export default function DashboardPage() {
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
               {challenges.map(challenge => {
+                const isGroupChallenge = (challenge.max_participants ?? 2) > 2
                 const opponentId = challenge.challenger_id === user.id ? challenge.opponent_id : challenge.challenger_id
                 const opponentName = challenge.opponentProfile?.username
                   ? `@${challenge.opponentProfile.username}`
@@ -359,10 +424,57 @@ export default function DashboardPage() {
                 const dayTotal = challenge.duration_days ?? 30
                 const pct = Math.min(100, Math.round((dayX / dayTotal) * 100))
 
+                // Build group members for group display
+                let groupMembers = []
+                if (isGroupChallenge) {
+                  const myName = profile?.username ? `@${profile.username}` : 'You'
+
+                  const cIsYou = challenge.challenger_id === user.id
+                  const cProfile = challenge.challengerProfile
+                  groupMembers.push({
+                    key: challenge.challenger_id,
+                    name: cIsYou ? myName : (cProfile?.username ? `@${cProfile.username}` : cProfile?.email ?? 'Unknown'),
+                    isYou: cIsYou,
+                    checkedInToday: checkins.some(c => c.user_id === challenge.challenger_id && c.checkin_date === todayStr),
+                    isPending: false,
+                  })
+
+                  if (challenge.opponent_id) {
+                    const oIsYou = challenge.opponent_id === user.id
+                    // Use mainOpponentProfile for correct name when user is a group participant
+                    const oProfile = challenge.mainOpponentProfile
+                    groupMembers.push({
+                      key: challenge.opponent_id,
+                      name: oIsYou ? myName : (oProfile?.username ? `@${oProfile.username}` : oProfile?.email ?? 'Unknown'),
+                      isYou: oIsYou,
+                      checkedInToday: checkins.some(c => c.user_id === challenge.opponent_id && c.checkin_date === todayStr),
+                      isPending: false,
+                    })
+                  }
+
+                  for (const gp of challenge.groupParticipants ?? []) {
+                    const gpIsYou = gp.user_id === user.id
+                    const gpProfile = gp.profile
+                    groupMembers.push({
+                      key: gp.user_id,
+                      name: gpIsYou ? myName : (gpProfile?.username ? `@${gpProfile.username}` : gpProfile?.email ?? 'Unknown'),
+                      isYou: gpIsYou,
+                      checkedInToday: checkins.some(c => c.user_id === gp.user_id && c.checkin_date === todayStr),
+                      isPending: gp.status === 'pending',
+                    })
+                  }
+                }
+
                 let statusMsg = '⏰ Check in before midnight!'
-                if (iCheckedIn && !theyCheckedIn) statusMsg = `🏆 ${opponentName} missed today! You're winning`
-                else if (!iCheckedIn && theyCheckedIn) statusMsg = `⚠️ Don't let ${opponentName} win! Check in now`
-                else if (iCheckedIn && theyCheckedIn) statusMsg = '💪 Both on track! Keep going'
+                if (isGroupChallenge) {
+                  const checkedCount = groupMembers.filter(m => m.checkedInToday).length
+                  if (iCheckedIn) statusMsg = `💪 ${checkedCount}/${groupMembers.length} checked in today`
+                  else statusMsg = `⏰ ${checkedCount}/${groupMembers.length} checked in — don't fall behind!`
+                } else {
+                  if (iCheckedIn && !theyCheckedIn) statusMsg = `🏆 ${opponentName} missed today! You're winning`
+                  else if (!iCheckedIn && theyCheckedIn) statusMsg = `⚠️ Don't let ${opponentName} win! Check in now`
+                  else if (iCheckedIn && theyCheckedIn) statusMsg = '💪 Both on track! Keep going'
+                }
 
                 return (
                   <div key={challenge.id} style={{
@@ -370,15 +482,16 @@ export default function DashboardPage() {
                     border: '1px solid rgba(255,255,255,0.07)',
                     borderRadius: 20,
                     padding: '24px 28px',
-                    transition: 'border-color 0.2s',
                   }}>
                     {/* Title row */}
-                    <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 16, gap: 12 }}>
+                    <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 4, gap: 12 }}>
                       <div>
                         <h3 style={{ fontWeight: 700, fontSize: 17, margin: '0 0 2px' }}>
                           {challenge.emoji ? `${challenge.emoji} ` : ''}{challenge.habit_name}
                         </h3>
-                        <p style={{ color: '#6b7280', fontSize: 13, margin: 0 }}>vs {opponentName}</p>
+                        <p style={{ color: '#6b7280', fontSize: 13, margin: 0 }}>
+                          {isGroupChallenge ? `${groupMembers.length} participants` : `vs ${opponentName}`}
+                        </p>
                       </div>
                       <span style={{
                         fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase',
@@ -387,6 +500,15 @@ export default function DashboardPage() {
                         padding: '4px 12px', borderRadius: 100, whiteSpace: 'nowrap', flexShrink: 0,
                       }}>Active</span>
                     </div>
+
+                    {/* Stake */}
+                    {challenge.stake ? (
+                      <p style={{ fontSize: 12, color: '#f97316', margin: '6px 0 16px', fontWeight: 500 }}>
+                        💰 Stake: {challenge.stake}
+                      </p>
+                    ) : (
+                      <div style={{ marginBottom: 16 }} />
+                    )}
 
                     {/* Progress */}
                     <div style={{ marginBottom: 20 }}>
@@ -400,27 +522,49 @@ export default function DashboardPage() {
                     </div>
 
                     {/* Participants */}
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 20 }}>
-                      {[
-                        { label: displayName, userId: user.id, checkedIn: iCheckedIn, streak: myStreak, isYou: true },
-                        { label: opponentName, userId: opponentId, checkedIn: theyCheckedIn, streak: opponentStreak, isYou: false },
-                      ].map(({ label, checkedIn, streak, isYou }) => (
-                        <div key={label} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                            <div style={{
-                              width: 24, height: 24, borderRadius: '50%',
-                              backgroundColor: checkedIn ? '#16a34a' : 'rgba(255,255,255,0.08)',
-                              border: checkedIn ? '2px solid #16a34a' : '2px solid rgba(255,255,255,0.12)',
-                              display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                    {isGroupChallenge ? (
+                      <div style={{ marginBottom: 20 }}>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                          {groupMembers.map(member => (
+                            <div key={member.key} style={{
+                              display: 'flex', alignItems: 'center', gap: 6,
+                              padding: '6px 12px', borderRadius: 100,
+                              backgroundColor: member.isYou ? 'rgba(249,115,22,0.1)' : 'rgba(255,255,255,0.04)',
+                              border: member.isYou ? '1px solid rgba(249,115,22,0.25)' : '1px solid rgba(255,255,255,0.08)',
                             }}>
-                              {checkedIn && <span style={{ fontSize: 12 }}>✓</span>}
+                              <span style={{ fontSize: 14, lineHeight: 1 }}>
+                                {member.isPending ? '⏳' : member.checkedInToday ? '✅' : '❌'}
+                              </span>
+                              <span style={{ fontSize: 13, color: member.isYou ? '#f97316' : '#9ca3af', fontWeight: member.isYou ? 600 : 400 }}>
+                                {member.name}
+                              </span>
                             </div>
-                            <span style={{ fontSize: 14, fontWeight: isYou ? 600 : 400, color: isYou ? '#fff' : '#9ca3af' }}>{label}</span>
-                          </div>
-                          <span style={{ fontSize: 14, fontWeight: 700, color: '#f97316' }}>{streak} 🔥</span>
+                          ))}
                         </div>
-                      ))}
-                    </div>
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 20 }}>
+                        {[
+                          { label: displayName, userId: user.id, checkedIn: iCheckedIn, streak: myStreak, isYou: true },
+                          { label: opponentName, userId: opponentId, checkedIn: theyCheckedIn, streak: opponentStreak, isYou: false },
+                        ].map(({ label, checkedIn, streak, isYou }) => (
+                          <div key={label} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                              <div style={{
+                                width: 24, height: 24, borderRadius: '50%',
+                                backgroundColor: checkedIn ? '#16a34a' : 'rgba(255,255,255,0.08)',
+                                border: checkedIn ? '2px solid #16a34a' : '2px solid rgba(255,255,255,0.12)',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                              }}>
+                                {checkedIn && <span style={{ fontSize: 12 }}>✓</span>}
+                              </div>
+                              <span style={{ fontSize: 14, fontWeight: isYou ? 600 : 400, color: isYou ? '#fff' : '#9ca3af' }}>{label}</span>
+                            </div>
+                            <span style={{ fontSize: 14, fontWeight: 700, color: '#f97316' }}>{streak} 🔥</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
 
                     {/* Status + Button */}
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
@@ -478,7 +622,12 @@ export default function DashboardPage() {
                       <p style={{ fontWeight: 600, fontSize: 15, margin: '0 0 2px' }}>
                         {challengerName} challenged you to <span style={{ color: '#f97316' }}>{challenge.habit_name}</span>
                       </p>
-                      <p style={{ color: '#6b7280', fontSize: 13, margin: 0 }}>{challenge.duration_days}-day challenge</p>
+                      <p style={{ color: '#6b7280', fontSize: 13, margin: 0 }}>
+                        {challenge.duration_days}-day challenge
+                        {challenge.isGroupParticipant && (
+                          <span style={{ marginLeft: 6, color: '#f97316', fontWeight: 500 }}>· Group challenge</span>
+                        )}
+                      </p>
                     </div>
                     <div style={{ display: 'flex', gap: 8 }}>
                       <button

@@ -1,9 +1,10 @@
 'use client'
 
-import { use, useEffect, useState } from 'react'
+import { use, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase'
+import { checkAndAwardBadges } from '@/lib/badges'
 
 function toDateStr(date) {
   const year = date.getFullYear()
@@ -48,15 +49,54 @@ function buildCalendarRows(calendarDays) {
 
 export default function ChallengeDetailPage({ params }) {
   const { id } = use(params)
-  const [user, setUser] = useState(null)
-  const [myProfile, setMyProfile] = useState(null)
-  const [challenge, setChallenge] = useState(null)
+  const [user, setUser]                       = useState(null)
+  const [myProfile, setMyProfile]             = useState(null)
+  const [challenge, setChallenge]             = useState(null)
   const [opponentProfile, setOpponentProfile] = useState(null)
-  const [checkins, setCheckins] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [checkingIn, setCheckingIn] = useState(false)
-  const router = useRouter()
+  const [checkins, setCheckins]               = useState([])
+  const [loading, setLoading]                 = useState(true)
+  const [checkingIn, setCheckingIn]           = useState(false)
+  const completionHandledRef = useRef(false)
+  const router   = useRouter()
   const todayStr = toDateStr(new Date())
+
+  // Auto-complete a challenge once its duration has elapsed
+  async function processCompletion(challengeData, checkinsData, userId) {
+    if (completionHandledRef.current) return
+    if (challengeData.status !== 'active') return
+    const start = challengeData.start_date ? new Date(challengeData.start_date + 'T00:00:00') : null
+    if (!start) return
+    const dayX = Math.floor((new Date() - start) / 86400000) + 1
+    if (dayX <= challengeData.duration_days) return
+
+    completionHandledRef.current = true
+
+    const opponentId = challengeData.challenger_id === userId ? challengeData.opponent_id : challengeData.challenger_id
+    const myCount  = checkinsData.filter(c => c.user_id === userId).length
+    const oppCount = checkinsData.filter(c => c.user_id === opponentId).length
+    const winnerId = myCount > oppCount ? userId : (oppCount > myCount ? opponentId : null)
+    const loserId  = winnerId ? (winnerId === userId ? opponentId : userId) : null
+
+    const supabase = createClient()
+    const { data: updated } = await supabase
+      .from('habit_challenges')
+      .update({ status: 'completed', winner_id: winnerId })
+      .eq('id', challengeData.id)
+      .select()
+      .single()
+    if (updated) setChallenge(updated)
+
+    if (winnerId && loserId) {
+      fetch('/api/update-rivalry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ winner_id: winnerId, loser_id: loserId, challenge_id: challengeData.id }),
+      }).catch(err => console.error('rivalry update failed:', err))
+    }
+
+    const supabase2 = createClient()
+    checkAndAwardBadges(userId, supabase2).catch(err => console.error('badge check failed:', err))
+  }
 
   useEffect(() => {
     async function load() {
@@ -66,30 +106,20 @@ export default function ChallengeDetailPage({ params }) {
       setUser(user)
 
       const { data: profileData } = await supabase
-        .from('profiles')
-        .select('id, username, email')
-        .eq('id', user.id)
-        .maybeSingle()
+        .from('profiles').select('id, username, email').eq('id', user.id).maybeSingle()
       setMyProfile(profileData)
 
       const { data: challengeData } = await supabase
-        .from('habit_challenges')
-        .select('*')
-        .eq('id', id)
-        .maybeSingle()
+        .from('habit_challenges').select('*').eq('id', id).maybeSingle()
 
       if (!challengeData) { router.replace('/dashboard'); return }
-
       if (challengeData.challenger_id !== user.id && challengeData.opponent_id !== user.id) {
-        router.replace('/dashboard')
-        return
+        router.replace('/dashboard'); return
       }
-
       setChallenge(challengeData)
 
       const opponentId = challengeData.challenger_id === user.id
-        ? challengeData.opponent_id
-        : challengeData.challenger_id
+        ? challengeData.opponent_id : challengeData.challenger_id
 
       const [{ data: oppProfile }, { data: checkinsData }] = await Promise.all([
         supabase.from('profiles').select('id, username, email').eq('id', opponentId).maybeSingle(),
@@ -97,8 +127,12 @@ export default function ChallengeDetailPage({ params }) {
       ])
 
       setOpponentProfile(oppProfile)
-      setCheckins(checkinsData ?? [])
+      const ci = checkinsData ?? []
+      setCheckins(ci)
       setLoading(false)
+
+      // Check if challenge should auto-complete on load
+      processCompletion(challengeData, ci, user.id)
     }
     load()
   }, [id, router])
@@ -113,7 +147,13 @@ export default function ChallengeDetailPage({ params }) {
       .select()
       .single()
     if (newCheckin) {
-      setCheckins(prev => [...prev, newCheckin])
+      const updated = [...checkins, newCheckin]
+      setCheckins(updated)
+      // Check badges after checkin (for streak badges)
+      const supabase2 = createClient()
+      checkAndAwardBadges(user.id, supabase2).catch(err => console.error('badge check failed:', err))
+      // Re-check completion in case this was the last day
+      if (challenge) processCompletion(challenge, updated, user.id)
     }
     setCheckingIn(false)
   }
@@ -133,13 +173,13 @@ export default function ChallengeDetailPage({ params }) {
 
   const opponentId = challenge.challenger_id === user.id ? challenge.opponent_id : challenge.challenger_id
 
-  const myCheckins = checkins.filter(c => c.user_id === user.id)
+  const myCheckins  = checkins.filter(c => c.user_id === user.id)
   const oppCheckins = checkins.filter(c => c.user_id === opponentId)
-  const myDates = new Set(myCheckins.map(c => c.checkin_date))
-  const oppDates = new Set(oppCheckins.map(c => c.checkin_date))
+  const myDates     = new Set(myCheckins.map(c => c.checkin_date))
+  const oppDates    = new Set(oppCheckins.map(c => c.checkin_date))
 
   const myDisplayName = myProfile?.username ? `@${myProfile.username}` : (user.email ?? 'You')
-  const opponentName = opponentProfile?.username ? `@${opponentProfile.username}` : (opponentProfile?.email ?? 'Opponent')
+  const opponentName  = opponentProfile?.username ? `@${opponentProfile.username}` : (opponentProfile?.email ?? 'Opponent')
 
   const statusMap = {
     active:    { bg: 'rgba(249,115,22,0.1)',  border: 'rgba(249,115,22,0.25)',  text: '#f97316',  label: 'Active'    },
@@ -149,19 +189,17 @@ export default function ChallengeDetailPage({ params }) {
   }
   const statusStyle = statusMap[challenge.status] ?? statusMap.pending
 
-  const today = new Date()
-  const start = challenge.start_date ? new Date(challenge.start_date + 'T00:00:00') : null
-  const dayX = start ? Math.max(1, Math.floor((today - start) / 86400000) + 1) : 1
+  const today    = new Date()
+  const start    = challenge.start_date ? new Date(challenge.start_date + 'T00:00:00') : null
+  const dayX     = start ? Math.max(1, Math.floor((today - start) / 86400000) + 1) : 1
   const dayTotal = challenge.duration_days ?? 30
   const dayDisplay = Math.min(dayX, dayTotal)
-  const pct = Math.min(100, Math.round((dayDisplay / dayTotal) * 100))
+  const pct      = Math.min(100, Math.round((dayDisplay / dayTotal) * 100))
 
   const iCheckedIn = myDates.has(todayStr)
 
-  // Calendar: show from start to today (or end_date if completed)
   const calendarEndStr = challenge.end_date && challenge.end_date < todayStr
-    ? challenge.end_date
-    : todayStr
+    ? challenge.end_date : todayStr
   const calendarDays = []
   if (start) {
     const cur = new Date(start)
@@ -173,29 +211,36 @@ export default function ChallengeDetailPage({ params }) {
   const calendarRows = buildCalendarRows(calendarDays)
 
   const totalElapsed = start ? Math.max(1, Math.min(dayX, dayTotal)) : 1
-  const myCompletions = myCheckins.length
+  const myCompletions  = myCheckins.length
   const oppCompletions = oppCheckins.length
-  const myCompPct = Math.round((myCompletions / totalElapsed) * 100)
+  const myCompPct  = Math.round((myCompletions / totalElapsed) * 100)
   const oppCompPct = Math.round((oppCompletions / totalElapsed) * 100)
-  const myStreak = calculateStreak(checkins, user.id)
-  const oppStreak = calculateStreak(checkins, opponentId)
+  const myStreak   = calculateStreak(checkins, user.id)
+  const oppStreak  = calculateStreak(checkins, opponentId)
 
   let winnerText, winnerColor, winnerBg, winnerBorder
   if (myCompletions > oppCompletions) {
-    winnerText = '🏆 You are currently winning'
-    winnerColor = '#f97316'
-    winnerBg = 'rgba(249,115,22,0.07)'
-    winnerBorder = 'rgba(249,115,22,0.2)'
+    winnerText = challenge.status === 'completed' ? '🏆 You won!' : '🏆 You are currently winning'
+    winnerColor = '#f97316'; winnerBg = 'rgba(249,115,22,0.07)'; winnerBorder = 'rgba(249,115,22,0.2)'
   } else if (oppCompletions > myCompletions) {
-    winnerText = `🏆 ${opponentName} is currently winning`
-    winnerColor = '#f87171'
-    winnerBg = 'rgba(239,68,68,0.06)'
-    winnerBorder = 'rgba(239,68,68,0.15)'
+    winnerText = challenge.status === 'completed' ? `💀 ${opponentName} won` : `🏆 ${opponentName} is currently winning`
+    winnerColor = '#f87171'; winnerBg = 'rgba(239,68,68,0.06)'; winnerBorder = 'rgba(239,68,68,0.15)'
   } else {
     winnerText = "🤝 It's a tie!"
-    winnerColor = '#9ca3af'
-    winnerBg = 'rgba(255,255,255,0.03)'
-    winnerBorder = 'rgba(255,255,255,0.08)'
+    winnerColor = '#9ca3af'; winnerBg = 'rgba(255,255,255,0.03)'; winnerBorder = 'rgba(255,255,255,0.08)'
+  }
+
+  // Stake card config based on status + outcome
+  let stakeEmoji = '⚔️', stakeLabel = 'On the line', stakeColor = '#f97316'
+  let stakeBg = 'rgba(249,115,22,0.07)', stakeBorder = 'rgba(249,115,22,0.2)'
+  if (challenge.status === 'completed' && challenge.winner_id) {
+    if (challenge.winner_id === user.id) {
+      stakeEmoji = '🏆'; stakeLabel = `You won! ${opponentName} owes you`
+      stakeColor = '#4ade80'; stakeBg = 'rgba(74,222,128,0.07)'; stakeBorder = 'rgba(74,222,128,0.2)'
+    } else {
+      stakeEmoji = '💀'; stakeLabel = `You lost! You owe ${opponentName}`
+      stakeColor = '#f87171'; stakeBg = 'rgba(248,113,113,0.07)'; stakeBorder = 'rgba(248,113,113,0.2)'
+    }
   }
 
   return (
@@ -225,7 +270,7 @@ export default function ChallengeDetailPage({ params }) {
 
       <main style={{ maxWidth: 720, margin: '0 auto', padding: '36px 20px 80px' }}>
 
-        {/* ── HEADER SECTION ── */}
+        {/* ── HEADER ── */}
         <section style={{ marginBottom: 32 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 6 }}>
             <h1 style={{ fontSize: 30, fontWeight: 800, margin: 0, letterSpacing: '-0.025em', lineHeight: 1.15 }}>
@@ -234,19 +279,15 @@ export default function ChallengeDetailPage({ params }) {
             <span style={{
               flexShrink: 0,
               fontSize: 11, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase',
-              color: statusStyle.text,
-              backgroundColor: statusStyle.bg,
+              color: statusStyle.text, backgroundColor: statusStyle.bg,
               border: `1px solid ${statusStyle.border}`,
-              padding: '5px 14px', borderRadius: 100,
-              marginTop: 4,
+              padding: '5px 14px', borderRadius: 100, marginTop: 4,
             }}>
               {statusStyle.label}
             </span>
           </div>
 
-          <p style={{ color: '#6b7280', fontSize: 15, margin: '0 0 20px' }}>
-            vs {opponentName}
-          </p>
+          <p style={{ color: '#6b7280', fontSize: 15, margin: '0 0 20px' }}>vs {opponentName}</p>
 
           {start && (
             <div>
@@ -258,8 +299,7 @@ export default function ChallengeDetailPage({ params }) {
                 <div style={{
                   height: '100%', width: `${pct}%`,
                   background: 'linear-gradient(90deg, #ea580c, #f97316)',
-                  borderRadius: 100,
-                  boxShadow: '0 0 16px rgba(249,115,22,0.45)',
+                  borderRadius: 100, boxShadow: '0 0 16px rgba(249,115,22,0.45)',
                   transition: 'width 0.6s ease',
                 }} />
               </div>
@@ -274,8 +314,7 @@ export default function ChallengeDetailPage({ params }) {
               <button disabled style={{
                 width: '100%', padding: '17px', borderRadius: 16,
                 backgroundColor: 'rgba(22,163,74,0.1)', border: '1px solid rgba(22,163,74,0.25)',
-                color: '#4ade80', fontWeight: 700, fontSize: 16, cursor: 'default',
-                letterSpacing: '0.01em',
+                color: '#4ade80', fontWeight: 700, fontSize: 16, cursor: 'default', letterSpacing: '0.01em',
               }}>
                 Checked In Today ✅
               </button>
@@ -300,92 +339,79 @@ export default function ChallengeDetailPage({ params }) {
           </section>
         )}
 
-        {/* ── CALENDAR SECTION ── */}
+        {/* ── STAKE CARD ── */}
+        {challenge.stake && (
+          <section style={{ marginBottom: 32 }}>
+            <div style={{
+              borderRadius: 16, padding: '18px 22px',
+              backgroundColor: stakeBg,
+              border: `1px solid ${stakeBorder}`,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                <span style={{ fontSize: 20 }}>{stakeEmoji}</span>
+                <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: stakeColor }}>
+                  {stakeLabel}
+                </span>
+              </div>
+              <p style={{ fontSize: 16, fontWeight: 700, color: '#fff', margin: 0, lineHeight: 1.4 }}>
+                {challenge.stake}
+              </p>
+            </div>
+          </section>
+        )}
+
+        {/* ── CALENDAR ── */}
         {start && calendarDays.length > 0 && (
           <section style={{ marginBottom: 32 }}>
             <div style={{
               backgroundColor: '#0f172a',
               border: '1px solid rgba(255,255,255,0.07)',
-              borderRadius: 20,
-              padding: '24px 20px',
+              borderRadius: 20, padding: '24px 20px',
             }}>
-              <h2 style={{
-                fontSize: 11, fontWeight: 700, letterSpacing: '0.12em',
-                textTransform: 'uppercase', color: '#f97316', margin: '0 0 16px',
-              }}>
+              <h2 style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', margin: '0 0 16px' }}>
                 Check-in History
               </h2>
 
-              {/* Legend */}
               <div style={{ display: 'flex', gap: 16, marginBottom: 16, flexWrap: 'wrap' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <div style={{ width: 10, height: 10, borderRadius: '50%', backgroundColor: '#22c55e', boxShadow: '0 0 6px rgba(34,197,94,0.5)' }} />
-                  <span style={{ fontSize: 12, color: '#6b7280' }}>You</span>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <div style={{ width: 10, height: 10, borderRadius: '50%', backgroundColor: '#3b82f6', boxShadow: '0 0 6px rgba(59,130,246,0.5)' }} />
-                  <span style={{ fontSize: 12, color: '#6b7280' }}>{opponentName}</span>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <div style={{ width: 10, height: 10, borderRadius: '50%', backgroundColor: 'rgba(255,255,255,0.1)' }} />
-                  <span style={{ fontSize: 12, color: '#4b5563' }}>Missed</span>
-                </div>
-              </div>
-
-              {/* Day-of-week headers */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 3, marginBottom: 3 }}>
-                {['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'].map(d => (
-                  <div key={d} style={{ textAlign: 'center', fontSize: 10, color: '#374151', fontWeight: 600, padding: '2px 0' }}>
-                    {d}
+                {[
+                  { color: '#22c55e', shadow: 'rgba(34,197,94,0.5)',   label: 'You'       },
+                  { color: '#3b82f6', shadow: 'rgba(59,130,246,0.5)',  label: opponentName },
+                  { color: 'rgba(255,255,255,0.1)', shadow: 'none',    label: 'Missed'    },
+                ].map(({ color, shadow, label }) => (
+                  <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <div style={{ width: 10, height: 10, borderRadius: '50%', backgroundColor: color, boxShadow: shadow !== 'none' ? `0 0 6px ${shadow}` : 'none' }} />
+                    <span style={{ fontSize: 12, color: '#6b7280' }}>{label}</span>
                   </div>
                 ))}
               </div>
 
-              {/* Calendar grid */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 3, marginBottom: 3 }}>
+                {['Su','Mo','Tu','We','Th','Fr','Sa'].map(d => (
+                  <div key={d} style={{ textAlign: 'center', fontSize: 10, color: '#374151', fontWeight: 600, padding: '2px 0' }}>{d}</div>
+                ))}
+              </div>
+
               {calendarRows.map((row, rowIdx) => (
                 <div key={rowIdx} style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 3, marginBottom: 3 }}>
                   {row.map((day, colIdx) => {
                     if (!day) return <div key={colIdx} style={{ minHeight: 54 }} />
-                    const isToday = day === todayStr
-                    const iMeChecked = myDates.has(day)
+                    const isToday     = day === todayStr
+                    const iMeChecked  = myDates.has(day)
                     const theyChecked = oppDates.has(day)
-                    const dayNum = parseInt(day.split('-')[2], 10)
                     return (
-                      <div
-                        key={day}
-                        style={{
-                          borderRadius: 8,
-                          padding: '6px 2px',
-                          backgroundColor: isToday ? 'rgba(249,115,22,0.1)' : 'rgba(255,255,255,0.02)',
-                          border: isToday ? '1px solid rgba(249,115,22,0.5)' : '1px solid rgba(255,255,255,0.04)',
-                          minHeight: 54,
-                          display: 'flex',
-                          flexDirection: 'column',
-                          alignItems: 'center',
-                          justifyContent: 'space-between',
-                          gap: 4,
-                        }}
-                      >
-                        <span style={{
-                          fontSize: 10, lineHeight: 1,
-                          color: isToday ? '#f97316' : '#374151',
-                          fontWeight: isToday ? 700 : 400,
-                        }}>
-                          {dayNum}
+                      <div key={day} style={{
+                        borderRadius: 8, padding: '6px 2px',
+                        backgroundColor: isToday ? 'rgba(249,115,22,0.1)' : 'rgba(255,255,255,0.02)',
+                        border: isToday ? '1px solid rgba(249,115,22,0.5)' : '1px solid rgba(255,255,255,0.04)',
+                        minHeight: 54, display: 'flex', flexDirection: 'column',
+                        alignItems: 'center', justifyContent: 'space-between', gap: 4,
+                      }}>
+                        <span style={{ fontSize: 10, lineHeight: 1, color: isToday ? '#f97316' : '#374151', fontWeight: isToday ? 700 : 400 }}>
+                          {parseInt(day.split('-')[2], 10)}
                         </span>
                         <div style={{ display: 'flex', gap: 3, alignItems: 'center' }}>
-                          <div style={{
-                            width: 8, height: 8, borderRadius: '50%',
-                            backgroundColor: iMeChecked ? '#22c55e' : 'rgba(255,255,255,0.1)',
-                            boxShadow: iMeChecked ? '0 0 5px rgba(34,197,94,0.7)' : 'none',
-                            transition: 'background-color 0.15s',
-                          }} />
-                          <div style={{
-                            width: 8, height: 8, borderRadius: '50%',
-                            backgroundColor: theyChecked ? '#3b82f6' : 'rgba(255,255,255,0.1)',
-                            boxShadow: theyChecked ? '0 0 5px rgba(59,130,246,0.7)' : 'none',
-                            transition: 'background-color 0.15s',
-                          }} />
+                          <div style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: iMeChecked ? '#22c55e' : 'rgba(255,255,255,0.1)', boxShadow: iMeChecked ? '0 0 5px rgba(34,197,94,0.7)' : 'none' }} />
+                          <div style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: theyChecked ? '#3b82f6' : 'rgba(255,255,255,0.1)', boxShadow: theyChecked ? '0 0 5px rgba(59,130,246,0.7)' : 'none' }} />
                         </div>
                       </div>
                     )
@@ -396,69 +422,36 @@ export default function ChallengeDetailPage({ params }) {
           </section>
         )}
 
-        {/* ── STATS SECTION ── */}
+        {/* ── STATS ── */}
         {start && (
           <section style={{ marginBottom: 32 }}>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
               {[
-                { label: myDisplayName, completions: myCompletions, compPct: myCompPct, streak: myStreak, isYou: true },
+                { label: myDisplayName, completions: myCompletions,  compPct: myCompPct,  streak: myStreak,  isYou: true  },
                 { label: opponentName,  completions: oppCompletions, compPct: oppCompPct, streak: oppStreak, isYou: false },
               ].map(({ label, completions, compPct, streak, isYou }) => (
                 <div key={label} style={{
                   backgroundColor: '#0f172a',
                   border: isYou ? '1px solid rgba(249,115,22,0.2)' : '1px solid rgba(255,255,255,0.07)',
-                  borderRadius: 20,
-                  padding: '20px',
-                  position: 'relative',
-                  overflow: 'hidden',
+                  borderRadius: 20, padding: '20px', position: 'relative', overflow: 'hidden',
                 }}>
-                  {isYou && (
-                    <div style={{
-                      position: 'absolute', top: 0, left: 0, right: 0, height: 2,
-                      background: 'linear-gradient(90deg, #ea580c, #f97316)',
-                    }} />
-                  )}
-
-                  <p style={{
-                    fontSize: 13, fontWeight: 700,
-                    color: isYou ? '#f97316' : '#6b7280',
-                    margin: '0 0 14px',
-                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                    letterSpacing: '0.02em',
-                  }}>
+                  {isYou && <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: 'linear-gradient(90deg, #ea580c, #f97316)' }} />}
+                  <p style={{ fontSize: 13, fontWeight: 700, color: isYou ? '#f97316' : '#6b7280', margin: '0 0 14px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', letterSpacing: '0.02em' }}>
                     {label}
                   </p>
-
                   <div style={{ marginBottom: 10 }}>
                     <div style={{ display: 'flex', alignItems: 'baseline', gap: 2 }}>
-                      <span style={{ fontSize: 28, fontWeight: 800, letterSpacing: '-0.03em', lineHeight: 1 }}>
-                        {completions}
-                      </span>
-                      <span style={{ fontSize: 14, color: '#374151', fontWeight: 500 }}>
-                        /{totalElapsed}
-                      </span>
+                      <span style={{ fontSize: 28, fontWeight: 800, letterSpacing: '-0.03em', lineHeight: 1 }}>{completions}</span>
+                      <span style={{ fontSize: 14, color: '#374151', fontWeight: 500 }}>/{totalElapsed}</span>
                     </div>
                     <p style={{ color: '#374151', fontSize: 12, margin: '3px 0 0' }}>days completed</p>
                   </div>
-
                   <div style={{ height: 3, backgroundColor: 'rgba(255,255,255,0.06)', borderRadius: 100, overflow: 'hidden', marginBottom: 12 }}>
-                    <div style={{
-                      height: '100%',
-                      width: `${compPct}%`,
-                      backgroundColor: isYou ? '#f97316' : '#4b5563',
-                      borderRadius: 100,
-                      transition: 'width 0.6s ease',
-                    }} />
+                    <div style={{ height: '100%', width: `${compPct}%`, backgroundColor: isYou ? '#f97316' : '#4b5563', borderRadius: 100, transition: 'width 0.6s ease' }} />
                   </div>
-
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <span style={{ fontSize: 12, color: '#4b5563' }}>{compPct}% done</span>
-                    <span style={{
-                      fontSize: 15, fontWeight: 800,
-                      color: isYou ? '#f97316' : '#6b7280',
-                    }}>
-                      {streak} 🔥
-                    </span>
+                    <span style={{ fontSize: 15, fontWeight: 800, color: isYou ? '#f97316' : '#6b7280' }}>{streak} 🔥</span>
                   </div>
                 </div>
               ))}
@@ -470,15 +463,9 @@ export default function ChallengeDetailPage({ params }) {
         {start && (
           <section>
             <div style={{
-              borderRadius: 16,
-              padding: '18px 24px',
-              backgroundColor: winnerBg,
-              border: `1px solid ${winnerBorder}`,
-              textAlign: 'center',
-              fontWeight: 700,
-              fontSize: 16,
-              color: winnerColor,
-              letterSpacing: '0.01em',
+              borderRadius: 16, padding: '18px 24px',
+              backgroundColor: winnerBg, border: `1px solid ${winnerBorder}`,
+              textAlign: 'center', fontWeight: 700, fontSize: 16, color: winnerColor, letterSpacing: '0.01em',
             }}>
               {winnerText}
             </div>
