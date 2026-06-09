@@ -2,8 +2,8 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import Link from 'next/link'
 import { createClient } from '@/lib/supabase'
+import { Navbar } from '@/components/Navbar'
 
 export default function NewHabitPage() {
   const [name, setName] = useState('')
@@ -34,21 +34,7 @@ export default function NewHabitPage() {
   return (
     <div style={{ minHeight: '100vh', backgroundColor: '#030712', color: '#fff', fontFamily: 'system-ui, sans-serif', display: 'flex', flexDirection: 'column' }}>
 
-      {/* Navbar */}
-      <header style={{
-        borderBottom: '1px solid rgba(255,255,255,0.06)',
-        backgroundColor: 'rgba(3,7,18,0.85)',
-        backdropFilter: 'blur(16px)',
-      }}>
-        <div style={{ maxWidth: 960, margin: '0 auto', padding: '0 20px', height: 60, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <Link href="/dashboard" style={{ fontWeight: 800, fontSize: 20, color: '#f97316', textDecoration: 'none', letterSpacing: '-0.01em' }}>
-            Streak 🔥
-          </Link>
-          <Link href="/dashboard" style={{ fontSize: 13, color: '#6b7280', textDecoration: 'none' }}>
-            ← Back
-          </Link>
-        </div>
-      </header>
+      <Navbar backHref="/dashboard" backLabel="← Back" />
 
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '32px 20px' }}>
         <div style={{ width: '100%', maxWidth: 440 }}>

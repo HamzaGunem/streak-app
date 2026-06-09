@@ -4,52 +4,14 @@ import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase'
-
-function toDateStr(date) {
-  const year = date.getFullYear()
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  return year + '-' + month + '-' + day
-}
-
-function calculateStreak(checkins, userId) {
-  if (!checkins || checkins.length === 0) return 0
-  const userCheckins = checkins.filter(c => c.user_id === userId)
-  const today = new Date()
-  const todayStr = toDateStr(today)
-  const yesterday = new Date()
-  yesterday.setDate(yesterday.getDate() - 1)
-  const yesterdayStr = toDateStr(yesterday)
-  const dates = new Set(userCheckins.map(c => c.checkin_date))
-  if (!dates.has(todayStr) && !dates.has(yesterdayStr)) return 0
-  const startStr = dates.has(todayStr) ? todayStr : yesterdayStr
-  let streak = 0
-  const current = new Date(startStr)
-  while (dates.has(toDateStr(current))) {
-    streak++
-    current.setDate(current.getDate() - 1)
-  }
-  return streak
-}
-
-function calculatePersonalStreak(completions) {
-  if (!completions || completions.length === 0) return 0
-  const today = new Date()
-  const todayStr = toDateStr(today)
-  const yesterday = new Date()
-  yesterday.setDate(yesterday.getDate() - 1)
-  const yesterdayStr = toDateStr(yesterday)
-  const dates = new Set(completions.map(c => c.completed_date))
-  if (!dates.has(todayStr) && !dates.has(yesterdayStr)) return 0
-  const startStr = dates.has(todayStr) ? todayStr : yesterdayStr
-  let streak = 0
-  const current = new Date(startStr)
-  while (dates.has(toDateStr(current))) {
-    streak++
-    current.setDate(current.getDate() - 1)
-  }
-  return streak
-}
+import { toDateStr, calculatePersonalStreak } from '@/lib/utils'
+import { loadNotifSettings, sendNotifications, TYPE_CATEGORY } from '@/lib/notifications'
+import { Navbar } from '@/components/Navbar'
+import { PageLoader } from '@/components/PageLoader'
+import { EmptyCard } from '@/components/EmptyCard'
+import { Modal } from '@/components/Modal'
+import { ChallengeCard } from '@/components/dashboard/ChallengeCard'
+import { PendingChallengeCard } from '@/components/dashboard/PendingChallengeCard'
 
 export default function DashboardPage() {
   const [user, setUser] = useState(null)
@@ -62,6 +24,7 @@ export default function DashboardPage() {
   const [togglingHabit, setTogglingHabit] = useState(new Set())
   const [habitToDelete, setHabitToDelete] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [unreadCount, setUnreadCount] = useState(0)
   const router = useRouter()
   const todayStr = toDateStr(new Date())
 
@@ -72,54 +35,29 @@ export default function DashboardPage() {
       if (!user) { router.replace('/login'); return }
       setUser(user)
 
-      const { data: profileData } = await supabase
-        .from('profiles')
-        .select('id, username, email, avatar')
-        .eq('id', user.id)
-        .maybeSingle()
+      const { data: profileData } = await supabase.from('profiles').select('id, username, email, avatar').eq('id', user.id).maybeSingle()
       setProfile(profileData)
 
-      // Fetch active challenges (direct) + pending main-opponent invites + group participation via API
-      const [
-        { data: directActive },
-        { data: pendingAsOpp },
-        groupInvitesRes,
-      ] = await Promise.all([
-        supabase.from('habit_challenges').select('*')
-          .or(`challenger_id.eq.${user.id},opponent_id.eq.${user.id}`)
-          .eq('status', 'active'),
-        supabase.from('habit_challenges').select('*')
-          .eq('opponent_id', user.id).eq('status', 'pending'),
-        fetch(`/api/group-invites?user_id=${user.id}`).then(r => r.json()).catch(() => ({ pending: [], activeIds: [] })),
+      const [{ data: directActive }, { data: pendingAsOpp }, groupInvitesRes] = await Promise.all([
+        supabase.from('habit_challenges').select('*').or(`challenger_id.eq.${user.id},opponent_id.eq.${user.id}`).eq('status', 'active'),
+        supabase.from('habit_challenges').select('*').eq('opponent_id', user.id).eq('status', 'pending'),
+        fetch(`/api/group-invites?user_id=${user.id}`).then(r => r.json()).catch(() => ({ pending: [], active: [] })),
       ])
 
       const { pending: pendingAsGroup, active: groupActive } = groupInvitesRes
-
-      // Merge group-participant active challenges (avoid duplicates with direct)
       const directActiveIds = new Set((directActive ?? []).map(c => c.id))
-      const activeChallenges = [
-        ...(directActive ?? []),
-        ...(groupActive ?? []).filter(c => !directActiveIds.has(c.id)),
-      ]
+      const activeChallenges = [...(directActive ?? []), ...(groupActive ?? []).filter(c => !directActiveIds.has(c.id))]
 
       if (activeChallenges.length > 0) {
         const challengeIds = activeChallenges.map(c => c.id)
-
-        // Primary "opponent" for each challenge (for solo display)
-        const opponentIds = activeChallenges.map(c =>
-          c.challenger_id === user.id ? c.opponent_id : c.challenger_id
-        )
-
+        const opponentIds = activeChallenges.map(c => c.challenger_id === user.id ? c.opponent_id : c.challenger_id)
         const [{ data: opponentProfiles }, { data: allCheckins }, { data: allParticipants }] = await Promise.all([
           supabase.from('profiles').select('id, username, email').in('id', opponentIds),
           supabase.from('challenge_checkins').select('*').in('challenge_id', challengeIds),
           supabase.from('challenge_participants').select('challenge_id, user_id, status').in('challenge_id', challengeIds),
         ])
-
         const profileMap = {}
         for (const p of opponentProfiles ?? []) profileMap[p.id] = p
-
-        // Fetch extra profiles: for group challenges fetch challenger + opponent + all participants
         const extraIds = new Set()
         for (const c of activeChallenges) {
           if ((c.max_participants ?? 2) > 2) {
@@ -127,83 +65,47 @@ export default function DashboardPage() {
             if (c.opponent_id && !profileMap[c.opponent_id] && c.opponent_id !== user.id) extraIds.add(c.opponent_id)
           }
         }
-        for (const p of allParticipants ?? []) {
-          if (!profileMap[p.user_id] && p.user_id !== user.id) extraIds.add(p.user_id)
-        }
+        for (const p of allParticipants ?? []) { if (!profileMap[p.user_id] && p.user_id !== user.id) extraIds.add(p.user_id) }
         if (extraIds.size > 0) {
-          const { data: extraProfiles } = await supabase
-            .from('profiles').select('id, username, email').in('id', [...extraIds])
+          const { data: extraProfiles } = await supabase.from('profiles').select('id, username, email').in('id', [...extraIds])
           for (const p of extraProfiles ?? []) profileMap[p.id] = p
         }
-
-        const checkinsByChallenge = {}
-        const participantsByChallenge = {}
-        for (const id of challengeIds) {
-          checkinsByChallenge[id] = []
-          participantsByChallenge[id] = []
-        }
-        for (const ci of allCheckins ?? []) {
-          if (checkinsByChallenge[ci.challenge_id]) checkinsByChallenge[ci.challenge_id].push(ci)
-        }
-        for (const p of allParticipants ?? []) {
-          if (participantsByChallenge[p.challenge_id]) participantsByChallenge[p.challenge_id].push(p)
-        }
-
+        const checkinsByChallenge = {}, participantsByChallenge = {}
+        for (const id of challengeIds) { checkinsByChallenge[id] = []; participantsByChallenge[id] = [] }
+        for (const ci of allCheckins ?? []) { if (checkinsByChallenge[ci.challenge_id]) checkinsByChallenge[ci.challenge_id].push(ci) }
+        for (const p of allParticipants ?? []) { if (participantsByChallenge[p.challenge_id]) participantsByChallenge[p.challenge_id].push(p) }
         setChallenges(activeChallenges.map(c => {
           const opponentId = c.challenger_id === user.id ? c.opponent_id : c.challenger_id
-          return {
-            ...c,
-            opponentProfile: profileMap[opponentId] ?? null,
-            mainOpponentProfile: profileMap[c.opponent_id] ?? null,
-            challengerProfile: profileMap[c.challenger_id] ?? null,
-            checkins: checkinsByChallenge[c.id] ?? [],
-            groupParticipants: (participantsByChallenge[c.id] ?? []).map(p => ({
-              ...p,
-              profile: profileMap[p.user_id] ?? null,
-            })),
-          }
+          return { ...c, opponentProfile: profileMap[opponentId] ?? null, mainOpponentProfile: profileMap[c.opponent_id] ?? null, challengerProfile: profileMap[c.challenger_id] ?? null, checkins: checkinsByChallenge[c.id] ?? [], groupParticipants: (participantsByChallenge[c.id] ?? []).map(p => ({ ...p, profile: profileMap[p.user_id] ?? null })) }
         }))
       }
 
-      // Build pending list: main opponent invites + group participant invites (from API)
-      const allPending = [
-        ...(pendingAsOpp ?? []).map(c => ({ ...c, isGroupParticipant: false })),
-        ...pendingAsGroup,
-      ]
-
+      const allPending = [...(pendingAsOpp ?? []).map(c => ({ ...c, isGroupParticipant: false })), ...pendingAsGroup]
       if (allPending.length > 0) {
         const challengerIds = allPending.map(c => c.challenger_id)
-        const { data: challengerProfiles } = await supabase
-          .from('profiles').select('id, username, email').in('id', challengerIds)
-        const cProfileMap = {}
-        for (const p of challengerProfiles ?? []) cProfileMap[p.id] = p
-        setPendingChallenges(allPending.map(c => ({
-          ...c,
-          challengerProfile: cProfileMap[c.challenger_id] ?? null,
-        })))
+        const { data: challengerProfiles } = await supabase.from('profiles').select('id, username, email').in('id', challengerIds)
+        const cMap = {}
+        for (const p of challengerProfiles ?? []) cMap[p.id] = p
+        setPendingChallenges(allPending.map(c => ({ ...c, challengerProfile: cMap[c.challenger_id] ?? null })))
       }
 
-      // Personal habits
-      const { data: habitsData } = await supabase
-        .from('habits').select('*').eq('user_id', user.id)
-        .order('created_at', { ascending: false })
+      const { data: habitsData } = await supabase.from('habits').select('*').eq('user_id', user.id).order('created_at', { ascending: false })
       setHabits(habitsData ?? [])
-
-      if (habitsData && habitsData.length > 0) {
-        const { data: completionsData } = await supabase
-          .from('personal_completions')
-          .select('habit_id, completed_date')
-          .eq('user_id', user.id)
-          .in('habit_id', habitsData.map(h => h.id))
+      if (habitsData?.length > 0) {
+        const { data: completionsData } = await supabase.from('personal_completions').select('habit_id, completed_date').eq('user_id', user.id).in('habit_id', habitsData.map(h => h.id))
         const map = {}
         for (const h of habitsData) map[h.id] = []
-        for (const c of completionsData ?? []) {
-          if (map[c.habit_id]) map[c.habit_id].push(c)
-        }
+        for (const c of completionsData ?? []) { if (map[c.habit_id]) map[c.habit_id].push(c) }
         setPersonalCompletions(map)
       }
 
       setLoading(false)
+
+      const notifSettings = loadNotifSettings(user.id)
+      const enabledTypes = Object.entries(TYPE_CATEGORY).filter(([, cat]) => notifSettings[cat]).map(([type]) => type)
+      let countQuery = supabase.from('notifications').select('id', { count: 'exact', head: true }).eq('user_id', user.id).eq('read', false)
+      if (enabledTypes.length < Object.keys(TYPE_CATEGORY).length) countQuery = countQuery.in('type', enabledTypes)
+      countQuery.then(({ count }) => setUnreadCount(count ?? 0)).catch(() => {})
     }
     load()
   }, [router])
@@ -218,76 +120,47 @@ export default function DashboardPage() {
     if (checkingIn.has(challenge.id)) return
     setCheckingIn(prev => new Set(prev).add(challenge.id))
     const supabase = createClient()
-    const { data: newCheckin } = await supabase
-      .from('challenge_checkins')
-      .insert({ challenge_id: challenge.id, user_id: user.id, checkin_date: todayStr })
-      .select()
-      .single()
+    const { data: newCheckin } = await supabase.from('challenge_checkins').insert({ challenge_id: challenge.id, user_id: user.id, checkin_date: todayStr }).select().single()
     if (newCheckin) {
-      setChallenges(prev => prev.map(c =>
-        c.id === challenge.id ? { ...c, checkins: [...c.checkins, newCheckin] } : c
-      ))
+      setChallenges(prev => prev.map(c => c.id === challenge.id ? { ...c, checkins: [...c.checkins, newCheckin] } : c))
+      const settings = loadNotifSettings(user.id)
+      if (settings.notify_checkin) sendNotifications([{ user_id: user.id, type: 'checkin_done', title: 'Checked in! 🔥', message: `You checked in for ${challenge.habit_name}. Keep the streak alive!` }])
     }
     setCheckingIn(prev => { const n = new Set(prev); n.delete(challenge.id); return n })
   }
 
   async function handleAcceptChallenge(challenge) {
     const supabase = createClient()
-
+    const myUsername = profile?.username ?? user.email
     if (challenge.isGroupParticipant) {
-      await fetch('/api/group-invites', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ challenge_id: challenge.id, user_id: user.id, status: 'accepted' }),
-      })
+      await fetch('/api/group-invites', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ challenge_id: challenge.id, user_id: user.id, status: 'accepted' }) })
+      sendNotifications([{ user_id: challenge.challenger_id, type: 'challenge_accepted', title: 'Challenge accepted! ✅', message: `@${myUsername} accepted your ${challenge.habit_name} challenge.` }])
       setPendingChallenges(prev => prev.filter(c => c.id !== challenge.id))
       router.push(`/challenges/${challenge.id}`)
       return
     }
-
-    // Main opponent accepting: start the challenge
-    const today = new Date()
-    const endDate = new Date(today)
-    endDate.setDate(endDate.getDate() + challenge.duration_days)
-    await supabase
-      .from('habit_challenges')
-      .update({ status: 'active', start_date: todayStr, end_date: toDateStr(endDate) })
-      .eq('id', challenge.id)
+    const endDate = new Date(); endDate.setDate(endDate.getDate() + challenge.duration_days)
+    await supabase.from('habit_challenges').update({ status: 'active', start_date: todayStr, end_date: toDateStr(endDate) }).eq('id', challenge.id)
+    sendNotifications([{ user_id: challenge.challenger_id, type: 'challenge_accepted', title: 'Challenge accepted! ✅', message: `@${myUsername} accepted your ${challenge.habit_name} challenge. It starts today!` }])
     setPendingChallenges(prev => prev.filter(c => c.id !== challenge.id))
-    const supabase2 = createClient()
-    const { data: updated } = await supabase2
-      .from('habit_challenges').select('*').eq('id', challenge.id).single()
+    const { data: updated } = await supabase.from('habit_challenges').select('*').eq('id', challenge.id).single()
     if (updated) {
       const opponentId = updated.challenger_id === user.id ? updated.opponent_id : updated.challenger_id
-      const { data: opponentProfiles } = await supabase2
-        .from('profiles').select('id, username, email').eq('id', opponentId)
-      const opponentProfile = opponentProfiles?.[0] ?? null
-      setChallenges(prev => [...prev, {
-        ...updated,
-        opponentProfile,
-        mainOpponentProfile: opponentProfile,
-        challengerProfile: null,
-        checkins: [],
-        groupParticipants: [],
-      }])
+      const { data: ops } = await supabase.from('profiles').select('id, username, email').eq('id', opponentId)
+      const opponentProfile = ops?.[0] ?? null
+      setChallenges(prev => [...prev, { ...updated, opponentProfile, mainOpponentProfile: opponentProfile, challengerProfile: null, checkins: [], groupParticipants: [] }])
     }
   }
 
   async function handleDeclineChallenge(challenge) {
     const supabase = createClient()
-
+    const myUsername = profile?.username ?? user.email
     if (challenge.isGroupParticipant) {
-      await fetch('/api/group-invites', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ challenge_id: challenge.id, user_id: user.id, status: 'declined' }),
-      })
+      await fetch('/api/group-invites', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ challenge_id: challenge.id, user_id: user.id, status: 'declined' }) })
     } else {
-      await supabase
-        .from('habit_challenges')
-        .update({ status: 'declined' })
-        .eq('id', challenge.id)
+      await supabase.from('habit_challenges').update({ status: 'declined' }).eq('id', challenge.id)
     }
+    sendNotifications([{ user_id: challenge.challenger_id, type: 'challenge_declined', title: 'Challenge declined ❌', message: `@${myUsername} declined your ${challenge.habit_name} challenge.` }])
     setPendingChallenges(prev => prev.filter(c => c.id !== challenge.id))
   }
 
@@ -298,384 +171,81 @@ export default function DashboardPage() {
     const completions = personalCompletions[habit.id] ?? []
     const doneToday = completions.some(c => c.completed_date === todayStr)
     if (doneToday) {
-      await supabase.from('personal_completions').delete()
-        .eq('habit_id', habit.id).eq('user_id', user.id).eq('completed_date', todayStr)
-      setPersonalCompletions(prev => ({
-        ...prev,
-        [habit.id]: prev[habit.id].filter(c => c.completed_date !== todayStr),
-      }))
+      await supabase.from('personal_completions').delete().eq('habit_id', habit.id).eq('user_id', user.id).eq('completed_date', todayStr)
+      setPersonalCompletions(prev => ({ ...prev, [habit.id]: prev[habit.id].filter(c => c.completed_date !== todayStr) }))
     } else {
       await supabase.from('personal_completions').insert({ habit_id: habit.id, user_id: user.id, completed_date: todayStr })
-      setPersonalCompletions(prev => ({
-        ...prev,
-        [habit.id]: [...(prev[habit.id] ?? []), { habit_id: habit.id, completed_date: todayStr }],
-      }))
+      setPersonalCompletions(prev => ({ ...prev, [habit.id]: [...(prev[habit.id] ?? []), { habit_id: habit.id, completed_date: todayStr }] }))
     }
     setTogglingHabit(prev => { const n = new Set(prev); n.delete(habit.id); return n })
   }
 
   async function confirmDeleteHabit() {
-    const habit = habitToDelete
-    setHabitToDelete(null)
+    const habit = habitToDelete; setHabitToDelete(null)
     const supabase = createClient()
     await supabase.from('habits').delete().eq('id', habit.id)
     setHabits(prev => prev.filter(h => h.id !== habit.id))
     setPersonalCompletions(prev => { const n = { ...prev }; delete n[habit.id]; return n })
   }
 
-  if (loading) {
-    return (
-      <div style={{ minHeight: '100vh', backgroundColor: '#030712', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: 32, marginBottom: 12 }}>🔥</div>
-          <p style={{ color: '#6b7280', fontSize: 14 }}>Loading your dashboard…</p>
-        </div>
-      </div>
-    )
-  }
+  if (loading) return <PageLoader text="Loading your dashboard…" />
 
-  const displayName = profile?.username ? `${profile.username}` : (user?.email ?? '')
+  const displayName = profile?.username ?? (user?.email ?? '')
+
+  const navRight = (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+      <Link href="/leaderboard" style={{ fontSize: 13, color: '#6b7280', textDecoration: 'none', padding: '6px 10px', borderRadius: 8 }} title="Leaderboard">🏆</Link>
+      <Link href="/notifications" style={{ position: 'relative', fontSize: 18, textDecoration: 'none', padding: '6px 8px', borderRadius: 8, lineHeight: 1, display: 'flex', alignItems: 'center' }} title="Notifications">
+        🔔
+        {unreadCount > 0 && <span style={{ position: 'absolute', top: 2, right: 2, width: 8, height: 8, borderRadius: '50%', backgroundColor: '#f97316', border: '1.5px solid #030712' }} />}
+      </Link>
+      <Link href="/profile" style={{ display: 'flex', alignItems: 'center', gap: 7, textDecoration: 'none', padding: '5px 10px', borderRadius: 10, border: '1px solid rgba(255,255,255,0.08)', backgroundColor: 'rgba(255,255,255,0.03)' }}
+        onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(249,115,22,0.35)'; e.currentTarget.style.backgroundColor = 'rgba(249,115,22,0.07)' }}
+        onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.08)'; e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.03)' }}
+      >
+        <span style={{ fontSize: 16 }}>{profile?.avatar || '🔥'}</span>
+        <span style={{ fontSize: 13, color: '#9ca3af', fontWeight: 500 }}>{displayName}</span>
+      </Link>
+      <button onClick={handleSignOut} style={{ fontSize: 13, color: '#6b7280', background: 'none', border: 'none', cursor: 'pointer', padding: '6px 12px', borderRadius: 8 }}
+        onMouseEnter={e => e.target.style.color = '#fff'} onMouseLeave={e => e.target.style.color = '#6b7280'}>Sign out</button>
+    </div>
+  )
 
   return (
     <div style={{ minHeight: '100vh', backgroundColor: '#030712', color: '#fff', fontFamily: 'system-ui, sans-serif' }}>
-
-      {/* Navbar */}
-      <header style={{
-        position: 'sticky', top: 0, zIndex: 50,
-        backgroundColor: 'rgba(3,7,18,0.85)',
-        backdropFilter: 'blur(16px)',
-        borderBottom: '1px solid rgba(255,255,255,0.06)',
-      }}>
-        <div style={{ maxWidth: 960, margin: '0 auto', padding: '0 20px', height: 60, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <span style={{ fontWeight: 800, fontSize: 20, color: '#f97316', letterSpacing: '-0.01em' }}>Streak 🔥</span>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <Link
-              href="/profile"
-              style={{
-                display: 'flex', alignItems: 'center', gap: 7,
-                textDecoration: 'none',
-                padding: '5px 10px', borderRadius: 10,
-                border: '1px solid rgba(255,255,255,0.08)',
-                backgroundColor: 'rgba(255,255,255,0.03)',
-                transition: 'border-color 0.15s, background-color 0.15s',
-              }}
-              onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(249,115,22,0.35)'; e.currentTarget.style.backgroundColor = 'rgba(249,115,22,0.07)' }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.08)'; e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.03)' }}
-            >
-              <span style={{ fontSize: 16, lineHeight: 1 }}>{profile?.avatar || '🔥'}</span>
-              <span style={{ fontSize: 13, color: '#9ca3af', fontWeight: 500 }}>{displayName}</span>
-            </Link>
-            <button
-              onClick={handleSignOut}
-              style={{ fontSize: 13, color: '#6b7280', background: 'none', border: 'none', cursor: 'pointer', padding: '6px 12px', borderRadius: 8, transition: 'color 0.15s' }}
-              onMouseEnter={e => e.target.style.color = '#fff'}
-              onMouseLeave={e => e.target.style.color = '#6b7280'}
-            >
-              Sign out
-            </button>
-          </div>
-        </div>
-      </header>
+      <Navbar maxWidth={960} right={navRight} />
 
       <main style={{ maxWidth: 960, margin: '0 auto', padding: '32px 20px 120px' }}>
-
-        {/* Welcome */}
         <div style={{ marginBottom: 40 }}>
-          <h1 style={{ fontSize: 28, fontWeight: 800, margin: '0 0 4px', letterSpacing: '-0.02em' }}>
-            Welcome back, {displayName} 🔥
-          </h1>
-          <p style={{ color: '#6b7280', fontSize: 14, margin: 0 }}>
-            {challenges.length} active challenge{challenges.length !== 1 ? 's' : ''}
-          </p>
+          <h1 style={{ fontSize: 28, fontWeight: 800, margin: '0 0 4px', letterSpacing: '-0.02em' }}>Welcome back, {displayName} 🔥</h1>
+          <p style={{ color: '#6b7280', fontSize: 14, margin: 0 }}>{challenges.length} active challenge{challenges.length !== 1 ? 's' : ''}</p>
         </div>
 
-        {/* ── Active Challenges ── */}
         <section style={{ marginBottom: 48 }}>
-          <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', marginBottom: 16 }}>
-            Active Challenges
-          </h2>
-
+          <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', marginBottom: 16 }}>Active Challenges</h2>
           {challenges.length === 0 ? (
-            <EmptyCard>
-              No active challenges yet.{' '}
-              <Link href="/challenges/new" style={{ color: '#f97316', textDecoration: 'none', fontWeight: 600 }}>Start one →</Link>
-            </EmptyCard>
+            <EmptyCard>No active challenges yet. <Link href="/challenges/new" style={{ color: '#f97316', textDecoration: 'none', fontWeight: 600 }}>Start one →</Link></EmptyCard>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-              {challenges.map(challenge => {
-                const isGroupChallenge = (challenge.max_participants ?? 2) > 2
-                const opponentId = challenge.challenger_id === user.id ? challenge.opponent_id : challenge.challenger_id
-                const opponentName = challenge.opponentProfile?.username
-                  ? `@${challenge.opponentProfile.username}`
-                  : (challenge.opponentProfile?.email ?? 'Opponent')
-
-                const checkins = challenge.checkins ?? []
-                const myCheckins = checkins.filter(c => c.user_id === user.id)
-                const opponentCheckins = checkins.filter(c => c.user_id === opponentId)
-                const iCheckedIn = myCheckins.some(c => c.checkin_date === todayStr)
-                const theyCheckedIn = opponentCheckins.some(c => c.checkin_date === todayStr)
-                const myStreak = calculateStreak(checkins, user.id)
-                const opponentStreak = calculateStreak(checkins, opponentId)
-                const isCheckingIn = checkingIn.has(challenge.id)
-
-                const start = challenge.start_date ? new Date(challenge.start_date) : new Date()
-                const today = new Date()
-                const dayX = Math.max(1, Math.floor((today - start) / 86400000) + 1)
-                const dayTotal = challenge.duration_days ?? 30
-                const pct = Math.min(100, Math.round((dayX / dayTotal) * 100))
-
-                // Build group members for group display
-                let groupMembers = []
-                if (isGroupChallenge) {
-                  const myName = profile?.username ? `@${profile.username}` : 'You'
-
-                  const cIsYou = challenge.challenger_id === user.id
-                  const cProfile = challenge.challengerProfile
-                  groupMembers.push({
-                    key: challenge.challenger_id,
-                    name: cIsYou ? myName : (cProfile?.username ? `@${cProfile.username}` : cProfile?.email ?? 'Unknown'),
-                    isYou: cIsYou,
-                    checkedInToday: checkins.some(c => c.user_id === challenge.challenger_id && c.checkin_date === todayStr),
-                    isPending: false,
-                  })
-
-                  if (challenge.opponent_id) {
-                    const oIsYou = challenge.opponent_id === user.id
-                    // Use mainOpponentProfile for correct name when user is a group participant
-                    const oProfile = challenge.mainOpponentProfile
-                    groupMembers.push({
-                      key: challenge.opponent_id,
-                      name: oIsYou ? myName : (oProfile?.username ? `@${oProfile.username}` : oProfile?.email ?? 'Unknown'),
-                      isYou: oIsYou,
-                      checkedInToday: checkins.some(c => c.user_id === challenge.opponent_id && c.checkin_date === todayStr),
-                      isPending: false,
-                    })
-                  }
-
-                  for (const gp of challenge.groupParticipants ?? []) {
-                    const gpIsYou = gp.user_id === user.id
-                    const gpProfile = gp.profile
-                    groupMembers.push({
-                      key: gp.user_id,
-                      name: gpIsYou ? myName : (gpProfile?.username ? `@${gpProfile.username}` : gpProfile?.email ?? 'Unknown'),
-                      isYou: gpIsYou,
-                      checkedInToday: checkins.some(c => c.user_id === gp.user_id && c.checkin_date === todayStr),
-                      isPending: gp.status === 'pending',
-                    })
-                  }
-                }
-
-                let statusMsg = '⏰ Check in before midnight!'
-                if (isGroupChallenge) {
-                  const checkedCount = groupMembers.filter(m => m.checkedInToday).length
-                  if (iCheckedIn) statusMsg = `💪 ${checkedCount}/${groupMembers.length} checked in today`
-                  else statusMsg = `⏰ ${checkedCount}/${groupMembers.length} checked in — don't fall behind!`
-                } else {
-                  if (iCheckedIn && !theyCheckedIn) statusMsg = `🏆 ${opponentName} missed today! You're winning`
-                  else if (!iCheckedIn && theyCheckedIn) statusMsg = `⚠️ Don't let ${opponentName} win! Check in now`
-                  else if (iCheckedIn && theyCheckedIn) statusMsg = '💪 Both on track! Keep going'
-                }
-
-                return (
-                  <div key={challenge.id} style={{
-                    backgroundColor: '#0f172a',
-                    border: '1px solid rgba(255,255,255,0.07)',
-                    borderRadius: 20,
-                    padding: '24px 28px',
-                  }}>
-                    {/* Title row */}
-                    <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 4, gap: 12 }}>
-                      <div>
-                        <h3 style={{ fontWeight: 700, fontSize: 17, margin: '0 0 2px' }}>
-                          {challenge.emoji ? `${challenge.emoji} ` : ''}{challenge.habit_name}
-                        </h3>
-                        <p style={{ color: '#6b7280', fontSize: 13, margin: 0 }}>
-                          {isGroupChallenge ? `${groupMembers.length} participants` : `vs ${opponentName}`}
-                        </p>
-                      </div>
-                      <span style={{
-                        fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase',
-                        color: '#f97316', backgroundColor: 'rgba(249,115,22,0.1)',
-                        border: '1px solid rgba(249,115,22,0.2)',
-                        padding: '4px 12px', borderRadius: 100, whiteSpace: 'nowrap', flexShrink: 0,
-                      }}>Active</span>
-                    </div>
-
-                    {/* Stake */}
-                    {challenge.stake ? (
-                      <p style={{ fontSize: 12, color: '#f97316', margin: '6px 0 16px', fontWeight: 500 }}>
-                        💰 Stake: {challenge.stake}
-                      </p>
-                    ) : (
-                      <div style={{ marginBottom: 16 }} />
-                    )}
-
-                    {/* Progress */}
-                    <div style={{ marginBottom: 20 }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: '#6b7280', marginBottom: 6 }}>
-                        <span>Day {dayX} of {dayTotal}</span>
-                        <span style={{ color: '#f97316', fontWeight: 600 }}>{pct}%</span>
-                      </div>
-                      <div style={{ height: 6, backgroundColor: 'rgba(255,255,255,0.06)', borderRadius: 100, overflow: 'hidden' }}>
-                        <div style={{ height: '100%', width: `${pct}%`, backgroundColor: '#f97316', borderRadius: 100, boxShadow: '0 0 12px rgba(249,115,22,0.6)' }} />
-                      </div>
-                    </div>
-
-                    {/* Participants */}
-                    {isGroupChallenge ? (
-                      <div style={{ marginBottom: 20 }}>
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                          {groupMembers.map(member => (
-                            <div key={member.key} style={{
-                              display: 'flex', alignItems: 'center', gap: 6,
-                              padding: '6px 12px', borderRadius: 100,
-                              backgroundColor: member.isYou ? 'rgba(249,115,22,0.1)' : 'rgba(255,255,255,0.04)',
-                              border: member.isYou ? '1px solid rgba(249,115,22,0.25)' : '1px solid rgba(255,255,255,0.08)',
-                            }}>
-                              <span style={{ fontSize: 14, lineHeight: 1 }}>
-                                {member.isPending ? '⏳' : member.checkedInToday ? '✅' : '❌'}
-                              </span>
-                              <span style={{ fontSize: 13, color: member.isYou ? '#f97316' : '#9ca3af', fontWeight: member.isYou ? 600 : 400 }}>
-                                {member.name}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    ) : (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 20 }}>
-                        {[
-                          { label: displayName, userId: user.id, checkedIn: iCheckedIn, streak: myStreak, isYou: true },
-                          { label: opponentName, userId: opponentId, checkedIn: theyCheckedIn, streak: opponentStreak, isYou: false },
-                        ].map(({ label, checkedIn, streak, isYou }) => (
-                          <div key={label} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                              <div style={{
-                                width: 24, height: 24, borderRadius: '50%',
-                                backgroundColor: checkedIn ? '#16a34a' : 'rgba(255,255,255,0.08)',
-                                border: checkedIn ? '2px solid #16a34a' : '2px solid rgba(255,255,255,0.12)',
-                                display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-                              }}>
-                                {checkedIn && <span style={{ fontSize: 12 }}>✓</span>}
-                              </div>
-                              <span style={{ fontSize: 14, fontWeight: isYou ? 600 : 400, color: isYou ? '#fff' : '#9ca3af' }}>{label}</span>
-                            </div>
-                            <span style={{ fontSize: 14, fontWeight: 700, color: '#f97316' }}>{streak} 🔥</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-
-                    {/* Status + Button */}
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-                      <p style={{ fontSize: 13, color: '#9ca3af', margin: 0 }}>{statusMsg}</p>
-                      {iCheckedIn ? (
-                        <button disabled style={{
-                          fontSize: 13, fontWeight: 700, padding: '9px 20px', borderRadius: 12,
-                          backgroundColor: 'rgba(22,163,74,0.15)', border: '1px solid rgba(22,163,74,0.3)',
-                          color: '#4ade80', cursor: 'default',
-                        }}>
-                          Checked In ✅
-                        </button>
-                      ) : (
-                        <button
-                          onClick={() => handleCheckIn(challenge)}
-                          disabled={isCheckingIn}
-                          style={{
-                            fontSize: 13, fontWeight: 700, padding: '9px 20px', borderRadius: 12,
-                            backgroundColor: isCheckingIn ? 'rgba(249,115,22,0.4)' : '#f97316',
-                            border: 'none', color: '#fff', cursor: isCheckingIn ? 'default' : 'pointer',
-                            boxShadow: '0 4px 16px rgba(249,115,22,0.35)', transition: 'background 0.15s',
-                          }}
-                        >
-                          {isCheckingIn ? 'Checking in…' : 'Check In'}
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                )
-              })}
+              {challenges.map(challenge => <ChallengeCard key={challenge.id} challenge={challenge} user={user} profile={profile} todayStr={todayStr} checkingIn={checkingIn} onCheckIn={handleCheckIn} />)}
             </div>
           )}
         </section>
 
-        {/* ── Pending Challenges ── */}
         {pendingChallenges.length > 0 && (
           <section style={{ marginBottom: 48 }}>
-            <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', marginBottom: 16 }}>
-              Pending Challenges
-            </h2>
+            <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', marginBottom: 16 }}>Pending Challenges</h2>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {pendingChallenges.map(challenge => {
-                const challengerName = challenge.challengerProfile?.username
-                  ? `@${challenge.challengerProfile.username}`
-                  : (challenge.challengerProfile?.email ?? 'Someone')
-                return (
-                  <div key={challenge.id} style={{
-                    backgroundColor: '#0f172a',
-                    border: '1px solid rgba(249,115,22,0.15)',
-                    borderRadius: 16,
-                    padding: '20px 24px',
-                    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap',
-                  }}>
-                    <div>
-                      <p style={{ fontWeight: 600, fontSize: 15, margin: '0 0 2px' }}>
-                        {challengerName} challenged you to <span style={{ color: '#f97316' }}>{challenge.habit_name}</span>
-                      </p>
-                      <p style={{ color: '#6b7280', fontSize: 13, margin: 0 }}>
-                        {challenge.duration_days}-day challenge
-                        {challenge.isGroupParticipant && (
-                          <span style={{ marginLeft: 6, color: '#f97316', fontWeight: 500 }}>· Group challenge</span>
-                        )}
-                      </p>
-                    </div>
-                    <div style={{ display: 'flex', gap: 8 }}>
-                      <button
-                        onClick={() => handleDeclineChallenge(challenge)}
-                        style={{
-                          fontSize: 13, fontWeight: 600, padding: '8px 16px', borderRadius: 10,
-                          backgroundColor: 'transparent', border: '1px solid rgba(255,255,255,0.12)',
-                          color: '#9ca3af', cursor: 'pointer', transition: 'border-color 0.15s',
-                        }}
-                      >
-                        Decline
-                      </button>
-                      <button
-                        onClick={() => handleAcceptChallenge(challenge)}
-                        style={{
-                          fontSize: 13, fontWeight: 700, padding: '8px 20px', borderRadius: 10,
-                          backgroundColor: '#f97316', border: 'none', color: '#fff', cursor: 'pointer',
-                          boxShadow: '0 4px 14px rgba(249,115,22,0.35)', transition: 'background 0.15s',
-                        }}
-                      >
-                        Accept
-                      </button>
-                    </div>
-                  </div>
-                )
-              })}
+              {pendingChallenges.map(c => <PendingChallengeCard key={c.id} challenge={c} onAccept={handleAcceptChallenge} onDecline={handleDeclineChallenge} />)}
             </div>
           </section>
         )}
 
-        {/* ── Personal Habits ── */}
         <section>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-            <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', margin: 0 }}>
-              Personal Habits
-            </h2>
-            <Link
-              href="/habits/new"
-              style={{
-                fontSize: 13, fontWeight: 700, padding: '7px 16px', borderRadius: 10,
-                backgroundColor: '#f97316', color: '#fff', textDecoration: 'none',
-                boxShadow: '0 4px 14px rgba(249,115,22,0.3)',
-              }}
-            >
-              + Add Habit
-            </Link>
+            <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#f97316', margin: 0 }}>Personal Habits</h2>
+            <Link href="/habits/new" style={{ fontSize: 13, fontWeight: 700, padding: '7px 16px', borderRadius: 10, backgroundColor: '#f97316', color: '#fff', textDecoration: 'none', boxShadow: '0 4px 14px rgba(249,115,22,0.3)' }}>+ Add Habit</Link>
           </div>
-
           {habits.length === 0 ? (
             <EmptyCard>No personal habits yet. <Link href="/habits/new" style={{ color: '#f97316', textDecoration: 'none', fontWeight: 600 }}>Add one →</Link></EmptyCard>
           ) : (
@@ -685,49 +255,18 @@ export default function DashboardPage() {
                 const doneToday = completions.some(c => c.completed_date === todayStr)
                 const streak = calculatePersonalStreak(completions)
                 const isToggling = togglingHabit.has(habit.id)
-
                 return (
-                  <div
-                    key={habit.id}
-                    className="habit-row"
-                    style={{
-                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                      backgroundColor: '#0f172a',
-                      border: doneToday ? '1px solid rgba(22,163,74,0.3)' : '1px solid rgba(255,255,255,0.06)',
-                      borderRadius: 14, padding: '14px 18px',
-                    }}
-                  >
+                  <div key={habit.id} className="habit-row" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#0f172a', border: doneToday ? '1px solid rgba(22,163,74,0.3)' : '1px solid rgba(255,255,255,0.06)', borderRadius: 14, padding: '14px 18px' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                      <button
-                        onClick={() => toggleHabit(habit)}
-                        disabled={isToggling}
-                        style={{
-                          width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
-                          backgroundColor: doneToday ? '#16a34a' : 'transparent',
-                          border: doneToday ? '2px solid #16a34a' : '2px solid rgba(255,255,255,0.2)',
-                          display: 'flex', alignItems: 'center', justifyContent: 'center',
-                          cursor: isToggling ? 'default' : 'pointer', transition: 'all 0.15s', padding: 0,
-                        }}
-                      >
+                      <button onClick={() => toggleHabit(habit)} disabled={isToggling} style={{ width: 26, height: 26, borderRadius: '50%', flexShrink: 0, backgroundColor: doneToday ? '#16a34a' : 'transparent', border: doneToday ? '2px solid #16a34a' : '2px solid rgba(255,255,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: isToggling ? 'default' : 'pointer', transition: 'all 0.15s', padding: 0 }}>
                         {doneToday && <span style={{ fontSize: 13, color: '#fff' }}>✓</span>}
                       </button>
-                      <span style={{ fontSize: 15, fontWeight: 500, color: doneToday ? '#4ade80' : '#fff' }}>
-                        {habit.name}
-                      </span>
+                      <span style={{ fontSize: 15, fontWeight: 500, color: doneToday ? '#4ade80' : '#fff' }}>{habit.name}</span>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                       <span style={{ fontWeight: 700, color: '#f97316', fontSize: 15 }}>{streak} 🔥</span>
-                      <button
-                        onClick={() => setHabitToDelete(habit)}
-                        className="delete-btn"
-                        style={{
-                          background: 'none', border: 'none', cursor: 'pointer',
-                          color: '#ef4444', padding: '4px', borderRadius: 6, display: 'flex', opacity: 0, transition: 'opacity 0.15s',
-                        }}
-                      >
-                        <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                        </svg>
+                      <button onClick={() => setHabitToDelete(habit)} className="delete-btn" style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ef4444', padding: 4, borderRadius: 6, display: 'flex', opacity: 0, transition: 'opacity 0.15s' }}>
+                        <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                       </button>
                     </div>
                   </div>
@@ -738,78 +277,27 @@ export default function DashboardPage() {
         </section>
       </main>
 
-      {/* Floating New Challenge Button */}
-      <Link
-        href="/challenges/new"
-        style={{
-          position: 'fixed', bottom: 28, right: 28,
-          display: 'flex', alignItems: 'center', gap: 8,
-          backgroundColor: '#f97316', color: '#fff',
-          fontWeight: 700, fontSize: 14, textDecoration: 'none',
-          padding: '14px 22px', borderRadius: 50,
-          boxShadow: '0 8px 28px rgba(249,115,22,0.45)',
-          transition: 'transform 0.15s, box-shadow 0.15s',
-          zIndex: 40,
-        }}
+      <Link href="/challenges/new" style={{ position: 'fixed', bottom: 28, right: 28, display: 'flex', alignItems: 'center', gap: 8, backgroundColor: '#f97316', color: '#fff', fontWeight: 700, fontSize: 14, textDecoration: 'none', padding: '14px 22px', borderRadius: 50, boxShadow: '0 8px 28px rgba(249,115,22,0.45)', zIndex: 40 }}
         onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.boxShadow = '0 12px 36px rgba(249,115,22,0.55)' }}
-        onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 8px 28px rgba(249,115,22,0.45)' }}
-      >
+        onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 8px 28px rgba(249,115,22,0.45)' }}>
         ⚔️ New Challenge
       </Link>
 
-      {/* Delete Habit Modal */}
       {habitToDelete && (
-        <div
-          onClick={() => setHabitToDelete(null)}
-          style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 60, padding: 16 }}
-        >
-          <div
-            onClick={e => e.stopPropagation()}
-            style={{ backgroundColor: '#0f172a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 20, padding: 32, maxWidth: 360, width: '100%', textAlign: 'center' }}
-          >
-            <div style={{ width: 52, height: 52, borderRadius: '50%', backgroundColor: 'rgba(239,68,68,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-              <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="#ef4444" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-              </svg>
-            </div>
-            <h3 style={{ fontWeight: 700, fontSize: 18, margin: '0 0 8px' }}>Delete Habit</h3>
-            <p style={{ color: '#9ca3af', fontSize: 14, margin: '0 0 24px', lineHeight: 1.6 }}>
-              Delete <span style={{ color: '#f97316', fontWeight: 600 }}>{habitToDelete.name}</span>? All streak data will be lost.
-            </p>
-            <div style={{ display: 'flex', gap: 10 }}>
-              <button
-                onClick={() => setHabitToDelete(null)}
-                style={{ flex: 1, padding: '10px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.1)', backgroundColor: 'transparent', color: '#9ca3af', cursor: 'pointer', fontWeight: 600, fontSize: 14 }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={confirmDeleteHabit}
-                style={{ flex: 1, padding: '10px', borderRadius: 12, border: 'none', backgroundColor: '#dc2626', color: '#fff', cursor: 'pointer', fontWeight: 700, fontSize: 14 }}
-              >
-                Delete
-              </button>
-            </div>
+        <Modal onClose={() => setHabitToDelete(null)}>
+          <div style={{ width: 52, height: 52, borderRadius: '50%', backgroundColor: 'rgba(239,68,68,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+            <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="#ef4444" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
           </div>
-        </div>
+          <h3 style={{ fontWeight: 700, fontSize: 18, margin: '0 0 8px' }}>Delete Habit</h3>
+          <p style={{ color: '#9ca3af', fontSize: 14, margin: '0 0 24px', lineHeight: 1.6 }}>Delete <span style={{ color: '#f97316', fontWeight: 600 }}>{habitToDelete.name}</span>? All streak data will be lost.</p>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button onClick={() => setHabitToDelete(null)} style={{ flex: 1, padding: 10, borderRadius: 12, border: '1px solid rgba(255,255,255,0.1)', backgroundColor: 'transparent', color: '#9ca3af', cursor: 'pointer', fontWeight: 600, fontSize: 14 }}>Cancel</button>
+            <button onClick={confirmDeleteHabit} style={{ flex: 1, padding: 10, borderRadius: 12, border: 'none', backgroundColor: '#dc2626', color: '#fff', cursor: 'pointer', fontWeight: 700, fontSize: 14 }}>Delete</button>
+          </div>
+        </Modal>
       )}
 
-      <style>{`
-        .habit-row:hover .delete-btn { opacity: 1 !important; }
-      `}</style>
-    </div>
-  )
-}
-
-function EmptyCard({ children }) {
-  return (
-    <div style={{
-      backgroundColor: '#0f172a',
-      border: '1px solid rgba(255,255,255,0.06)',
-      borderRadius: 16, padding: '32px 24px',
-      textAlign: 'center', color: '#6b7280', fontSize: 14,
-    }}>
-      {children}
+      <style>{`.habit-row:hover .delete-btn { opacity: 1 !important; }`}</style>
     </div>
   )
 }

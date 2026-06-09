@@ -9,7 +9,12 @@
       "mcp__notion__notion-search",
       "mcp__notion__notion-fetch",
       "Bash(New-Item -ItemType Directory -Force -Path \"C:\\\\Users\\\\hamza\\\\Desktop\\\\Claude\\\\streak-app\\\\.claude\\\\commands\")",
-      "Bash(Out-Null)"
+      "Bash(Out-Null)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\hamza\\\\Desktop\\\\Claude\\\\streak-app\" -Force)",
+      "Bash(Select-Object Name)",
+      "Bash(git fetch *)",
+      "Bash(git rebase *)",
+      "Bash(git add *)"
     ]
   }
 }
